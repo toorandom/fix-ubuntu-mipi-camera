@@ -9,7 +9,14 @@ Many modern laptops with Intel 12th/13th gen CPUs have a MIPI camera connected t
 - A signed kernel module if **Secure Boot** is enabled
 
 This script automates the entire process, including Secure Boot MOK key generation, enrollment, and automatic re-signing on kernel updates.
-After finally making the camera work, I used vibe coding to help me make this program, I tested this on a non configured, non signed environnment and it worked, but read it first and use it at your own risk.
+After finally making the camera work, I used vibe coding to help me make this program. 
+
+I tested the resulting script on a non-configured Ubuntu 24.04.4 LTS 6.17.0-20-generic with non-BIOS-signed driver over a Dell XPS 13 9340 and it worked. 
+But read it first and use it at your own risk.
+
+Any kernel should work, and the solution should be able to survive kernel upgrades.
+
+
 **Author:** Eduardo Ruiz Duarte <toorandom@gmail.com>
 
 ---
