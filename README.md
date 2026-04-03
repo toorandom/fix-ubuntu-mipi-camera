@@ -17,6 +17,7 @@ If you do not want to trust the script, I explain below what to do manually.
 
 Any kernel should work, and the solution should be able to survive kernel upgrades.
 
+I tested with ffplay -f v4l2 -i /dev/video48 (or /dev/video0). Also you can check in https://webcammictest.com/ . DO NOT test with cheese, it does not work.
 
 **Author:** Eduardo Ruiz Duarte <toorandom@gmail.com>
 
