@@ -4,22 +4,55 @@
 # ==============================================================================
 # Questions: Eduardo Ruiz Duarte <toorandom@gmail.com>
 #
-# Fix Intel IPU6 camera on Ubuntu — with or without Secure Boot.
+# Make an Intel IPU6 MIPI camera work on Ubuntu — and keep it working across
+# kernel upgrades.
 #
-# What it does:
-#   - Installs v4l2loopback-dkms, v4l2-relayd, and Intel IPU6 GStreamer plugin
-#   - If Secure Boot is ON: generates a MOK key, enrolls it, and automatically
-#     signs the module after reboot (no manual steps beyond MOK Manager)
-#   - If Secure Boot is OFF: installs and loads everything in one shot
-#   - Installs a boot service that re-signs the module on kernel updates
-#   - Configures v4l2-relayd so the camera appears as a standard /dev/videoN
+# WHY THIS SCRIPT EXISTS
+# ----------------------
+# Intel's camera HAL (libcamhal, driven by the icamerasrc GStreamer element)
+# needs the PSYS device node /dev/ipu-psys0. PSYS is the hardware ISP
+# interface, and it only ever lived in Intel's out-of-tree IPU6 driver.
 #
-# Supported hardware : Laptops with Intel IPU6 (ov02c10, ov08x40, etc.)
-# Supported OS       : Ubuntu 22.04 / 24.04
-# Supported kernels  : 6.8 and newer
+# Since kernel 6.10 the IPU6 driver is in-tree and ships ISYS only. When the
+# out-of-tree intel-ipu6-psys module does not match the in-tree intel-ipu6 it
+# loads, never probes, and /dev/ipu-psys0 never appears. Everything else still
+# looks perfectly healthy — v4l2loopback loads, v4l2-relayd runs, /dev/videoN
+# exists — but not a single frame is ever produced. The only visible clue is:
+#
+#   journalctl -u v4l2-relayd@default.service -b | grep CamHAL
+#   CamHAL[ERR] Failed to open PSYS, error: No such file or directory
+#
+# That is why "my camera broke after a kernel upgrade" is so confusing, and
+# why checking module signatures or reinstalling packages never helps.
+#
+# WHAT THIS SCRIPT DOES
+#   - Picks the best pipeline that actually works on THIS kernel:
+#       * icamerasrc   — Intel HAL, hardware ISP. Best image quality.
+#                        Requires /dev/ipu-psys0.
+#       * libcamerasrc — libcamera + software ISP. Works with the in-tree
+#                        driver alone, so it survives any kernel upgrade.
+#                        Greener and darker unless a sensor tuning file exists.
+#     Both are fed into v4l2loopback, so the camera always shows up as a plain
+#     /dev/videoN that every app understands — Zoom included, which does not
+#     speak PipeWire camera.
+#   - Verifies by actually capturing frames, never by assuming success
+#   - Falls back from the HAL to libcamera automatically when the HAL yields
+#     no frames
+#   - Signs v4l2loopback for Secure Boot (MOK enrollment, two phases)
+#   - Installs a kernel hook that re-signs after every kernel upgrade
+#   - Refuses to keep an orphaned intel-ipu6-psys loaded: besides being
+#     useless it NULL-derefs the kernel in isys_runtime_pm_suspend
+#
+# Supported hardware : Laptops with Intel IPU6 (ov02c10, ov08x40, ...)
+# Supported OS       : Ubuntu 22.04 / 24.04 / 26.04
 #
 # Usage:
-#   sudo bash ipu6-camera-fix.sh
+#   sudo bash ipu6-camera-fix.sh              # install / repair
+#   sudo bash ipu6-camera-fix.sh --status     # diagnose only, change nothing
+#   sudo bash ipu6-camera-fix.sh --libcamera  # force the libcamera pipeline
+#   sudo bash ipu6-camera-fix.sh --hal        # force the Intel HAL pipeline
+#   sudo bash ipu6-camera-fix.sh --uninstall  # remove everything
+#   sudo bash ipu6-camera-fix.sh --yes        # never prompt
 # ==============================================================================
 
 set -euo pipefail
@@ -38,203 +71,250 @@ MODULES_LOAD_CONF="/etc/modules-load.d/v4l2loopback.conf"
 SIGN_SERVICE="/etc/systemd/system/sign-v4l2loopback.service"
 SIGN_SCRIPT="/usr/local/sbin/sign-v4l2loopback.sh"
 
+PSYS_GUARD="/usr/local/sbin/ipu6-psys-guard.sh"
+PSYS_GUARD_CONF="/etc/modprobe.d/ipu6-psys-guard.conf"
+
+KERNEL_HOOK="/etc/kernel/postinst.d/zy-${SCRIPT_NAME}"
+
 V4L2_RELAYD_CONF="/etc/v4l2-relayd.d/default.conf"
 CARD_LABEL="Intel MIPI Camera"
+
+SRC_HAL="icamerasrc buffer-count=7"
+SRC_LIBCAMERA="libcamerasrc"
+
+# The Intel HAL emits black frames until auto-exposure converges, so
+# verification has to discard the first couple of seconds.
+VERIFY_FRAMES=60
+VERIFY_MIN_BYTES=20000
+
+ASSUME_YES=0
+FORCE_SOURCE=""
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 info()    { echo "  [•] $*"; }
 ok()      { echo "  [✓] $*"; }
 warn()    { echo "  [!] $*" >&2; }
 die()     { echo "  [✗] $*" >&2; exit 1; }
-section() { echo; echo "▸ $*"; echo "  $(printf '%.0s─' {1..50})"; }
+section() { echo; echo "▸ $*"; echo "  $(printf '%.0s─' {1..60})"; }
 
-# ── Root check ─────────────────────────────────────────────────────────────────
+confirm() {
+    [[ $ASSUME_YES -eq 1 ]] && return 0
+    local ans
+    read -rp "  $1 [Y/n]: " ans
+    [[ ! "${ans:-y}" =~ ^[nN] ]]
+}
+
 [[ $EUID -eq 0 ]] || die "Run as root: sudo bash $0"
 
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR"
 
-# ── Phase helpers ──────────────────────────────────────────────────────────────
-get_phase()   { [[ -f "$PHASE_FILE" ]] && cat "$PHASE_FILE" || echo "1"; }
-set_phase()   { echo "$1" > "$PHASE_FILE"; }
+get_phase() { [[ -f "$PHASE_FILE" ]] && cat "$PHASE_FILE" || echo "1"; }
+set_phase() { echo "$1" > "$PHASE_FILE"; }
 
 # ── Detectors ──────────────────────────────────────────────────────────────────
+# NOTE: every check below captures output into a variable before filtering.
+# With `set -o pipefail`, `cmd | grep -q` fails when grep exits early and the
+# producer dies of SIGPIPE (141) — so the check would report the opposite of
+# the truth precisely when the match is found fast.
 secure_boot_on() {
-    mokutil --sb-state 2>/dev/null | grep -q "SecureBoot enabled"
+    local out
+    out=$(mokutil --sb-state 2>/dev/null) || true
+    [[ "$out" == *"SecureBoot enabled"* ]]
 }
 
+# /sys/module is authoritative and needs no pipeline at all.
+module_loaded() { [[ -d "/sys/module/${1//-/_}" ]]; }
+
 key_enrolled() {
-    if [[ ! -f "$MOK_DER" ]]; then return 1; fi
+    [[ -f "$MOK_DER" ]] || return 1
     local out
     out=$(mokutil --test-key "$MOK_DER" 2>/dev/null) || true
     grep -qE "is (already )?enrolled" <<< "$out"
 }
 
-has_icamerasrc() {
-    gst-inspect-1.0 icamerasrc &>/dev/null 2>&1
+has_element() { gst-inspect-1.0 "$1" &>/dev/null 2>&1; }
+
+# The HAL is usable only when the PSYS node exists. The rest of the Intel stack
+# can be perfectly installed and still produce nothing without it.
+hal_available() { [[ -e /dev/ipu-psys0 ]] && has_element icamerasrc; }
+
+libcamera_available() {
+    has_element libcamerasrc || return 1
+    command -v cam &>/dev/null || return 0
+    local out
+    out=$(cam -l 2>/dev/null) || true
+    grep -qE "^[0-9]+: " <<< "$out"
 }
 
-# ── Install packages ───────────────────────────────────────────────────────────
+# Find the loopback node by label: other v4l2loopback devices (OBS, DroidCam)
+# may exist, and picking the first one blindly would target the wrong device.
+camera_device() {
+    local p
+    for p in /sys/devices/virtual/video4linux/video*; do
+        [[ -e "$p" ]] || continue
+        [[ "$(cat "$p/name" 2>/dev/null)" == "$CARD_LABEL" ]] || continue
+        basename "$p"
+        return 0
+    done
+    return 1
+}
+
+current_source() {
+    [[ -f "$V4L2_RELAYD_CONF" ]] || return 1
+    local out
+    out=$(sed -n 's/^VIDEOSRC=//p' "$V4L2_RELAYD_CONF") || true
+    printf '%s\n' "$out" | head -1
+}
+
+# ── Packages ───────────────────────────────────────────────────────────────────
 install_packages() {
     section "Installing packages"
     local kver; kver=$(uname -r)
     local pkgs=(mokutil openssl v4l2loopback-dkms zstd ffmpeg v4l-utils gstreamer1.0-tools)
 
-    # IPU6-specific packages (install if available in apt)
-    for pkg in v4l2-relayd gstreamer1.0-icamera; do
+    local pkg
+    for pkg in v4l2-relayd gstreamer1.0-icamera gstreamer1.0-libcamera \
+               libcamera-tools libcamera-ipa; do
         apt-cache show "$pkg" &>/dev/null 2>&1 && pkgs+=("$pkg")
     done
 
-    # Kernel headers needed for sign-file
-    [[ -f "/usr/src/linux-headers-${kver}/scripts/sign-file" ]] || \
-        pkgs+=("linux-headers-${kver}")
+    [[ -f "/usr/src/linux-headers-${kver}/scripts/sign-file" ]] || pkgs+=("linux-headers-${kver}")
 
     DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}"
     ok "Packages ready"
 }
 
-# ── DKMS: ensure module is built for current kernel ───────────────────────────
+# ── Orphaned PSYS guard ────────────────────────────────────────────────────────
+# A plain blacklist would be wrong: kernels shipping Intel's complete
+# out-of-tree stack genuinely need this module, and on those it is what gives
+# you the hardware ISP. The decision can only be made at load time.
+install_psys_guard() {
+    section "Installing intel-ipu6-psys load guard"
+
+    cat > "$PSYS_GUARD" <<'EOF'
+#!/usr/bin/env bash
+# Keep intel-ipu6-psys loaded only if it actually probed. Against a mismatched
+# in-tree intel-ipu6 it never creates /dev/ipu-psys0 and corrupts ISYS runtime
+# PM (NULL deref in isys_runtime_pm_suspend). Installed by ipu6-camera-fix.sh.
+modprobe --ignore-install intel-ipu6-psys "$@" || exit 0
+
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -e /dev/ipu-psys0 ] && exit 0
+    sleep 0.2
+done
+
+logger -t ipu6-psys-guard \
+    "intel-ipu6-psys loaded but /dev/ipu-psys0 never appeared; unloading to protect ISYS"
+modprobe -r intel-ipu6-psys 2>/dev/null || true
+exit 0
+EOF
+    chmod 755 "$PSYS_GUARD"
+
+    cat > "$PSYS_GUARD_CONF" <<EOF
+# Generated by ${SCRIPT_NAME}
+install intel-ipu6-psys ${PSYS_GUARD} \$CMDLINE_OPTS
+EOF
+    ok "Guard installed"
+}
+
+# ── DKMS + Secure Boot signing ────────────────────────────────────────────────
 ensure_dkms_built() {
     local kver="${1:-$(uname -r)}"
-    if modinfo -k "$kver" -n v4l2loopback &>/dev/null; then
-        return 0
-    fi
+    modinfo -k "$kver" -n v4l2loopback &>/dev/null && return 0
     info "Building DKMS module for kernel $kver..."
-    local ver; ver=$(dkms status v4l2loopback 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1)
+    local st ver
+    st=$(dkms status v4l2loopback 2>/dev/null) || true
+    ver=$(grep -oP '\d+\.\d+\.\d+' <<< "$st" | head -1) || true
     [[ -n "$ver" ]] || die "v4l2loopback not found in DKMS"
     dkms install "v4l2loopback/${ver}" -k "$kver" --force
 }
 
-# ── Sign module — handles .ko / .ko.gz / .ko.xz / .ko.zst ────────────────────
 sign_module() {
     local kver="${1:-$(uname -r)}"
     local sign_file="/usr/src/linux-headers-${kver}/scripts/sign-file"
 
-    [[ -f "$sign_file" ]] || \
-        die "sign-file not found for kernel $kver — install: linux-headers-$kver"
-    [[ -f "$MOK_PRIV" && -f "$MOK_DER" ]] || \
-        die "MOK keys missing in $STATE_DIR"
+    [[ -f "$sign_file" ]] || die "sign-file not found for kernel $kver — install linux-headers-$kver"
+    [[ -f "$MOK_PRIV" && -f "$MOK_DER" ]] || die "MOK keys missing in $STATE_DIR"
 
     ensure_dkms_built "$kver"
     local module_path; module_path=$(modinfo -k "$kver" -n v4l2loopback)
     info "Signing: $module_path"
 
-    local tmp="/tmp/${SCRIPT_NAME}_$$.ko"
-
-    local ext=""
+    local tmp="/tmp/${SCRIPT_NAME}_$$.ko" ext=""
     [[ "$module_path" == *.ko.zst ]] && ext=".zst"
     [[ "$module_path" == *.ko.gz  ]] && ext=".gz"
     [[ "$module_path" == *.ko.xz  ]] && ext=".xz"
 
     case "$ext" in
         ".zst")
-            cp "$module_path" "${tmp}.zst"
-            chmod 644 "${tmp}.zst"
+            cp "$module_path" "${tmp}.zst"; chmod 644 "${tmp}.zst"
             zstd -d "${tmp}.zst" -o "$tmp" --force
             "$sign_file" sha256 "$MOK_PRIV" "$MOK_DER" "$tmp"
-            zstd -f "$tmp" -o "${tmp}.new"
-            cp "${tmp}.new" "$module_path"
-            rm -f "$tmp" "${tmp}.zst" "${tmp}.new"
-            ;;
+            zstd -f "$tmp" -o "${tmp}.new"; cp "${tmp}.new" "$module_path"
+            rm -f "$tmp" "${tmp}.zst" "${tmp}.new" ;;
         ".gz")
-            cp "$module_path" "${tmp}.gz"
-            gunzip -f "${tmp}.gz"
+            cp "$module_path" "${tmp}.gz"; gunzip -f "${tmp}.gz"
             "$sign_file" sha256 "$MOK_PRIV" "$MOK_DER" "$tmp"
-            gzip -f "$tmp"
-            cp "${tmp}.gz" "$module_path"
-            rm -f "$tmp" "${tmp}.gz"
-            ;;
+            gzip -f "$tmp"; cp "${tmp}.gz" "$module_path"
+            rm -f "$tmp" "${tmp}.gz" ;;
         ".xz")
-            cp "$module_path" "${tmp}.xz"
-            xz -d "${tmp}.xz"
+            cp "$module_path" "${tmp}.xz"; xz -d "${tmp}.xz"
             "$sign_file" sha256 "$MOK_PRIV" "$MOK_DER" "$tmp"
-            xz "$tmp"
-            cp "${tmp}.xz" "$module_path"
-            rm -f "$tmp" "${tmp}.xz"
-            ;;
-        *)
-            "$sign_file" sha256 "$MOK_PRIV" "$MOK_DER" "$module_path"
-            ;;
+            xz "$tmp"; cp "${tmp}.xz" "$module_path"
+            rm -f "$tmp" "${tmp}.xz" ;;
+        *)  "$sign_file" sha256 "$MOK_PRIV" "$MOK_DER" "$module_path" ;;
     esac
     ok "Module signed for kernel $kver"
 }
 
-# ── Generate MOK keys ──────────────────────────────────────────────────────────
 generate_mok_keys() {
     if [[ -f "$MOK_PRIV" && -f "$MOK_DER" ]]; then
         ok "MOK keys already exist, reusing"
         return
     fi
     info "Generating RSA-2048 MOK key pair..."
-    openssl req -new -x509 -newkey rsa:2048 \
-        -keyout "$MOK_PRIV" \
-        -outform DER -out "$MOK_DER" \
-        -days 36500 \
-        -subj "/CN=${MOK_CN}/" \
-        -nodes 2>/dev/null
+    openssl req -new -x509 -newkey rsa:2048 -keyout "$MOK_PRIV" \
+        -outform DER -out "$MOK_DER" -days 36500 \
+        -subj "/CN=${MOK_CN}/" -nodes 2>/dev/null
     chmod 600 "$MOK_PRIV"
     ok "Keys generated in $STATE_DIR"
 }
 
-# ── Boot signing script (re-signs on every kernel update) ─────────────────────
 install_signing_service() {
     section "Installing boot signing service"
-
-    # The script that runs at boot
     cat > "$SIGN_SCRIPT" <<'EOF'
 #!/usr/bin/env bash
-# Automatically re-signs v4l2loopback for the running kernel.
-# Installed by ipu6-camera-fix.sh — runs before modules are loaded.
+# Re-signs v4l2loopback for the running kernel. Installed by ipu6-camera-fix.sh.
 set -euo pipefail
-
 STATE_DIR="/var/lib/ipu6-camera-fix"
-MOK_PRIV="${STATE_DIR}/MOK.priv"
-MOK_DER="${STATE_DIR}/MOK.der"
-kver=$(uname -r)
-sign_file="/usr/src/linux-headers-${kver}/scripts/sign-file"
-
-[[ -f "$MOK_PRIV" && -f "$MOK_DER" ]] || { echo "[sign-v4l2loopback] MOK keys not found, skipping"; exit 0; }
-[[ -f "$sign_file" ]]                  || { echo "[sign-v4l2loopback] sign-file not found for $kver (install linux-headers-$kver)"; exit 0; }
-
-module_path=$(modinfo -k "$kver" -n v4l2loopback 2>/dev/null) || { echo "[sign-v4l2loopback] module not found for $kver"; exit 0; }
-
-tmp="/tmp/sign_v4l2loopback_$$.ko"
-ext=""
+MOK_PRIV="${STATE_DIR}/MOK.priv"; MOK_DER="${STATE_DIR}/MOK.der"
+kver=$(uname -r); sign_file="/usr/src/linux-headers-${kver}/scripts/sign-file"
+[[ -f "$MOK_PRIV" && -f "$MOK_DER" ]] || { echo "[sign-v4l2loopback] no MOK keys, skipping"; exit 0; }
+[[ -f "$sign_file" ]] || { echo "[sign-v4l2loopback] no sign-file for $kver"; exit 0; }
+module_path=$(modinfo -k "$kver" -n v4l2loopback 2>/dev/null) || { echo "[sign-v4l2loopback] module not found"; exit 0; }
+tmp="/tmp/sign_v4l2loopback_$$.ko"; ext=""
 [[ "$module_path" == *.ko.zst ]] && ext=".zst"
 [[ "$module_path" == *.ko.gz  ]] && ext=".gz"
 [[ "$module_path" == *.ko.xz  ]] && ext=".xz"
-
 case "$ext" in
-    ".zst")
-        cp "$module_path" "${tmp}.zst"; chmod 644 "${tmp}.zst"
-        zstd -d "${tmp}.zst" -o "$tmp" --force
-        "$sign_file" sha256 "$MOK_PRIV" "$MOK_DER" "$tmp"
-        zstd -f "$tmp" -o "${tmp}.new"
-        cp "${tmp}.new" "$module_path"
-        rm -f "$tmp" "${tmp}.zst" "${tmp}.new"
-        ;;
-    ".gz")
-        cp "$module_path" "${tmp}.gz"; gunzip -f "${tmp}.gz"
-        "$sign_file" sha256 "$MOK_PRIV" "$MOK_DER" "$tmp"
-        gzip -f "$tmp"; cp "${tmp}.gz" "$module_path"
-        rm -f "$tmp" "${tmp}.gz"
-        ;;
-    ".xz")
-        cp "$module_path" "${tmp}.xz"; xz -d "${tmp}.xz"
-        "$sign_file" sha256 "$MOK_PRIV" "$MOK_DER" "$tmp"
-        xz "$tmp"; cp "${tmp}.xz" "$module_path"
-        rm -f "$tmp" "${tmp}.xz"
-        ;;
-    *)
-        "$sign_file" sha256 "$MOK_PRIV" "$MOK_DER" "$module_path"
-        ;;
+    ".zst") cp "$module_path" "${tmp}.zst"; chmod 644 "${tmp}.zst"
+            zstd -d "${tmp}.zst" -o "$tmp" --force
+            "$sign_file" sha256 "$MOK_PRIV" "$MOK_DER" "$tmp"
+            zstd -f "$tmp" -o "${tmp}.new"; cp "${tmp}.new" "$module_path"
+            rm -f "$tmp" "${tmp}.zst" "${tmp}.new" ;;
+    ".gz")  cp "$module_path" "${tmp}.gz"; gunzip -f "${tmp}.gz"
+            "$sign_file" sha256 "$MOK_PRIV" "$MOK_DER" "$tmp"
+            gzip -f "$tmp"; cp "${tmp}.gz" "$module_path"; rm -f "$tmp" "${tmp}.gz" ;;
+    ".xz")  cp "$module_path" "${tmp}.xz"; xz -d "${tmp}.xz"
+            "$sign_file" sha256 "$MOK_PRIV" "$MOK_DER" "$tmp"
+            xz "$tmp"; cp "${tmp}.xz" "$module_path"; rm -f "$tmp" "${tmp}.xz" ;;
+    *)      "$sign_file" sha256 "$MOK_PRIV" "$MOK_DER" "$module_path" ;;
 esac
-
 echo "[sign-v4l2loopback] signed for kernel $kver: $module_path"
 EOF
     chmod 755 "$SIGN_SCRIPT"
 
-    # Systemd unit — runs before modules are loaded
     cat > "$SIGN_SERVICE" <<EOF
 [Unit]
 Description=Sign v4l2loopback for Secure Boot (kernel-update safe)
@@ -250,284 +330,324 @@ RemainAfterExit=yes
 [Install]
 WantedBy=sysinit.target
 EOF
-
     systemctl daemon-reload
     systemctl enable sign-v4l2loopback.service
-    ok "Boot signing service enabled (handles future kernel updates)"
+    ok "Boot signing service enabled"
 }
 
+# ── Kernel upgrade hook ────────────────────────────────────────────────────────
+install_kernel_hook() {
+    section "Installing kernel upgrade hook"
+    install -D -m 755 "$0" "$INSTALLED_SCRIPT"
+    cat > "$KERNEL_HOOK" <<EOF
+#!/bin/sh
+# Generated by ${SCRIPT_NAME}. Must never fail a kernel package install.
+[ -x "${INSTALLED_SCRIPT}" ] || exit 0
+"${INSTALLED_SCRIPT}" --kernel-hook "\$@" || true
+exit 0
+EOF
+    chmod 755 "$KERNEL_HOOK"
+    ok "Hook installed: $KERNEL_HOOK"
+}
 
-# ── Configure v4l2loopback boot loading ───────────────────────────────────────
+run_kernel_hook() {
+    local k="${1:-$(uname -r)}"
+    if secure_boot_on && [[ -f "$MOK_PRIV" ]] \
+       && [[ -f "/usr/src/linux-headers-${k}/scripts/sign-file" ]]; then
+        sign_module "$k" || true
+    fi
+    # Whether PSYS exists is a property of the kernel being booted, so the
+    # pipeline choice must be re-validated rather than inherited.
+    rm -f "${STATE_DIR}/verified"
+    exit 0
+}
+
+# ── Configuration ──────────────────────────────────────────────────────────────
 configure_boot_loading() {
     section "Configuring boot persistence"
-
     cat > "$MODPROBE_CONF" <<EOF
 # Generated by ${SCRIPT_NAME}
 options v4l2loopback exclusive_caps=1 card_label="${CARD_LABEL}"
 EOF
     echo "v4l2loopback" > "$MODULES_LOAD_CONF"
-
-    ok "v4l2loopback will load at boot with label: $CARD_LABEL"
+    ok "v4l2loopback will load at boot as: $CARD_LABEL"
 }
 
-# ── Configure v4l2-relayd ──────────────────────────────────────────────────────
-configure_v4l2relayd() {
-    if ! command -v v4l2-relayd &>/dev/null; then
-        warn "v4l2-relayd not installed, skipping"
-        return
-    fi
-    if ! has_icamerasrc; then
-        warn "icamerasrc GStreamer plugin not found, skipping v4l2-relayd config"
-        return
-    fi
-
-    section "Configuring v4l2-relayd (Intel IPU6 pipeline)"
+# v4l2-relayd accepts an arbitrary GStreamer source, which is what makes
+# switching between the Intel HAL and libcamera a single line of config.
+write_relayd_conf() {
+    local src="$1"
     mkdir -p /etc/v4l2-relayd.d
-
     cat > "$V4L2_RELAYD_CONF" <<EOF
 # Generated by ${SCRIPT_NAME}
-VIDEOSRC=icamerasrc buffer-count=7
+VIDEOSRC=${src}
 FORMAT=NV12
 WIDTH=1280
 HEIGHT=720
 FRAMERATE=30/1
 CARD_LABEL=${CARD_LABEL}
 EOF
-    ok "v4l2-relayd configured"
 }
 
-# ── Load module and start camera ───────────────────────────────────────────────
-load_and_start() {
-    section "Loading camera"
-
+load_module() {
     depmod -a
-
-    # Remove stale module if loaded
-    if lsmod | grep -q v4l2loopback; then
+    if module_loaded v4l2loopback; then
         modprobe -r v4l2loopback 2>/dev/null || true
     fi
     modprobe v4l2loopback
     ok "v4l2loopback loaded"
+}
 
-    # Start v4l2-relayd
-    if command -v v4l2-relayd &>/dev/null && has_icamerasrc; then
-        systemctl reset-failed 'v4l2-relayd@*' 2>/dev/null || true
-        systemctl enable --now v4l2-relayd@default.service
-        sleep 1
+restart_relayd() {
+    systemctl reset-failed 'v4l2-relayd@*' 2>/dev/null || true
+    systemctl enable --now v4l2-relayd@default.service
+    sleep 3
+}
 
-        local cam_dev
-        cam_dev=$(grep -rl "$CARD_LABEL" /sys/devices/virtual/video4linux/*/name 2>/dev/null \
-                  | head -1 | cut -d/ -f6 || echo "")
-        if [[ -n "$cam_dev" ]]; then
-            ok "Camera available at: /dev/${cam_dev}"
+# ── Verification ───────────────────────────────────────────────────────────────
+# Health is "a frame came out", never "the services look up": every component
+# can be green while the HAL silently fails to configure its pipeline.
+capture_works() {
+    local dev="$1" out="/tmp/${SCRIPT_NAME}_verify_$$.png" rc=1
+    command -v ffmpeg &>/dev/null || { warn "ffmpeg missing — cannot verify"; return 0; }
+    rm -f "$out"
+    timeout 60 ffmpeg -hide_banner -loglevel error -f v4l2 -i "/dev/${dev}" \
+        -frames:v "$VERIFY_FRAMES" -vsync 0 -update 1 -y "$out" &>/dev/null || true
+    # An all-black frame compresses to almost nothing, so size is the test.
+    if [[ -s "$out" ]] && [[ "$(stat -c%s "$out")" -gt "$VERIFY_MIN_BYTES" ]]; then
+        rc=0
+    fi
+    rm -f "$out"
+    return $rc
+}
+
+try_source() {
+    local src="$1" label="$2" dev
+    info "Trying pipeline: ${label}"
+    write_relayd_conf "$src"
+    restart_relayd
+    dev=$(camera_device) || { warn "No /dev/videoN labelled '$CARD_LABEL'"; return 1; }
+    if capture_works "$dev"; then
+        ok "${label} works — camera live on /dev/${dev}"
+        return 0
+    fi
+    warn "${label} produced no usable frames"
+    return 1
+}
+
+setup_pipeline() {
+    section "Selecting camera pipeline"
+
+    if [[ "$FORCE_SOURCE" == "hal" ]]; then
+        hal_available || die "HAL unavailable: /dev/ipu-psys0 missing or icamerasrc not installed"
+        try_source "$SRC_HAL" "Intel HAL (hardware ISP)" && return 0
+        die "Forced HAL pipeline produced no frames"
+    fi
+    if [[ "$FORCE_SOURCE" == "libcamera" ]]; then
+        libcamera_available || die "libcamera unavailable: install gstreamer1.0-libcamera libcamera-ipa"
+        try_source "$SRC_LIBCAMERA" "libcamera + software ISP" && return 0
+        die "Forced libcamera pipeline produced no frames"
+    fi
+
+    # Prefer the HAL: a hardware ISP means correct exposure and white balance.
+    if hal_available; then
+        info "/dev/ipu-psys0 present — the Intel HAL is available"
+        try_source "$SRC_HAL" "Intel HAL (hardware ISP)" && return 0
+        warn "Falling back to libcamera"
+    else
+        info "/dev/ipu-psys0 absent — this kernel cannot drive the Intel HAL"
+    fi
+
+    if libcamera_available; then
+        try_source "$SRC_LIBCAMERA" "libcamera + software ISP" && return 0
+    else
+        warn "libcamera pipeline unavailable (install gstreamer1.0-libcamera libcamera-ipa)"
+    fi
+
+    return 1
+}
+
+# ── Status ─────────────────────────────────────────────────────────────────────
+cmd_status() {
+    local dev; dev=$(camera_device || echo "")
+    section "Diagnosis"
+    echo "  Kernel            : $(uname -r)"
+    echo "  Ubuntu            : $(lsb_release -ds 2>/dev/null || echo '?')"
+    echo "  intel-ipu6        : $(modinfo -n intel-ipu6 2>/dev/null || echo 'not found')"
+    echo "  /dev/ipu-psys0    : $([[ -e /dev/ipu-psys0 ]] && echo 'present (HAL usable)' || echo 'MISSING (HAL impossible)')"
+    echo "  icamerasrc        : $(has_element icamerasrc && echo present || echo missing)"
+    echo "  libcamerasrc      : $(has_element libcamerasrc && echo present || echo missing)"
+    echo "  Secure Boot       : $(secure_boot_on && echo enabled || echo disabled)"
+    echo "  MOK enrolled      : $(key_enrolled && echo yes || echo no)"
+    echo "  v4l2loopback      : $(module_loaded v4l2loopback && echo loaded || echo 'not loaded')"
+    echo "  v4l2-relayd       : $(systemctl is-active 'v4l2-relayd@default.service' 2>/dev/null || true)"
+    echo "  Active pipeline   : $(current_source 2>/dev/null || echo 'not configured')"
+    echo "  Camera node       : $([[ -n "$dev" ]] && echo "/dev/$dev" || echo none)"
+    echo "  PSYS guard        : $([[ -f "$PSYS_GUARD_CONF" ]] && echo installed || echo 'not installed')"
+    echo "  Kernel hook       : $([[ -f "$KERNEL_HOOK" ]] && echo installed || echo 'not installed')"
+
+    if [[ -n "$dev" ]]; then
+        section "Live capture test"
+        if capture_works "$dev"; then
+            ok "Camera is delivering frames"
         else
-            warn "Module loaded but camera device not yet visible — try: v4l2-ctl --list-devices"
+            warn "Camera is NOT delivering frames — re-run without --status to repair"
         fi
+    fi
+
+    local sync; sync=$(dmesg 2>/dev/null | grep -cE 'Frame sync error' || true)
+    if [[ "${sync:-0}" -gt 0 ]]; then
+        echo
+        info "CSI-2 'Frame sync error' seen ${sync} time(s) this boot."
+        info "If the image freezes on the last frame, restart the pipeline:"
+        info "    sudo systemctl restart v4l2-relayd@default.service"
     fi
 }
 
-# ── Uninstall everything ───────────────────────────────────────────────────────
+# ── Uninstall ──────────────────────────────────────────────────────────────────
 uninstall() {
-    section "Uninstall — removing IPU6 camera fix"
-
-    # 1. Parar y deshabilitar servicios
-    if systemctl is-enabled sign-v4l2loopback.service &>/dev/null; then
-        systemctl disable --now sign-v4l2loopback.service 2>/dev/null || true
-        ok "Signing service disabled"
-    fi
-    if systemctl is-active 'v4l2-relayd@default.service' &>/dev/null; then
-        systemctl disable --now v4l2-relayd@default.service 2>/dev/null || true
-        ok "v4l2-relayd stopped"
-    fi
-
-    # 2. Unload module
-    if lsmod | grep -q v4l2loopback; then
+    section "Uninstall"
+    systemctl disable --now sign-v4l2loopback.service 2>/dev/null || true
+    systemctl disable --now v4l2-relayd@default.service 2>/dev/null || true
+    if module_loaded v4l2loopback; then
         modprobe -r v4l2loopback 2>/dev/null || true
-        ok "v4l2loopback unloaded"
     fi
 
-    # 3. Borrar archivos instalados por el script
     rm -f "$MODPROBE_CONF" "$MODULES_LOAD_CONF" "$SIGN_SERVICE" "$SIGN_SCRIPT"
-    rm -f "$V4L2_RELAYD_CONF"
+    rm -f "$V4L2_RELAYD_CONF" "$PSYS_GUARD_CONF" "$PSYS_GUARD"
+    rm -f "$KERNEL_HOOK" "$INSTALLED_SCRIPT"
     systemctl daemon-reload
-    ok "Config files removed"
+    ok "Files, guard, hook and services removed"
 
-    # 4. Remove MOK key from firmware (if it exists and is enrolled)
-    if [[ -f "$MOK_DER" ]]; then
-        if key_enrolled; then
-            echo
-            info "Queueing MOK key deletion from firmware..."
-            echo "  You will be prompted for a temporary password."
-            echo "  Write it down — you will enter it at the MOK Manager screen after reboot."
-            echo
-            mokutil --delete "$MOK_DER"
-            echo
-            echo "  ┌─────────────────────────────────────────────────────────┐"
-            echo "  │  REBOOT REQUIRED — follow these steps at the blue screen│"
-            echo "  │                                                         │"
-            echo "  │    1.  Delete MOK                                       │"
-            echo "  │    2.  Continue                                         │"
-            echo "  │    3.  Yes                                              │"
-            echo "  │    4.  Enter the password you just created              │"
-            echo "  │    5.  Reboot                                           │"
-            echo "  │                                                         │"
-            echo "  │  The key will be removed from firmware on next reboot. │"
-            echo "  └─────────────────────────────────────────────────────────┘"
-            echo
-        else
-            info "MOK key exists on disk but is not enrolled in firmware — skipping mokutil"
-        fi
-    else
-        info "No MOK key found on disk"
+    local was_enrolled=false
+    if [[ -f "$MOK_DER" ]] && key_enrolled; then
+        was_enrolled=true
+        echo
+        info "Queueing MOK key deletion from firmware..."
+        echo "  You will be asked for a temporary password; you re-enter it at"
+        echo "  the blue MOK Manager screen after rebooting."
+        echo
+        mokutil --delete "$MOK_DER" || true
     fi
 
-    # 5. Borrar directorio de estado (claves y phase file)
-    local mok_was_enrolled=false
-    key_enrolled && mok_was_enrolled=true || true
     rm -rf "$STATE_DIR"
-    ok "State directory removed ($STATE_DIR)"
-
+    ok "State directory removed"
     echo
-    echo "  Uninstall complete."
-    if $mok_was_enrolled; then
-        echo "  Reboot and confirm MOK deletion at the blue screen to finish."
-    fi
-
-    echo
-    info "Reboot manually to complete the uninstall."
-    if $mok_was_enrolled; then
-        echo "  At the blue MOK Manager screen, confirm the key deletion."
+    echo "  Uninstall complete. Reboot to finish."
+    if $was_enrolled; then
+        echo "  At the blue screen: Delete MOK → Continue → Yes → password → Reboot."
     fi
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
+ACTION="install"; HOOK_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --uninstall)   ACTION="uninstall" ;;
+        --status|-s)   ACTION="status" ;;
+        --kernel-hook) ACTION="hook"; shift; HOOK_ARGS=("$@"); break ;;
+        --libcamera)   FORCE_SOURCE="libcamera" ;;
+        --hal)         FORCE_SOURCE="hal" ;;
+        --phase2)      set_phase "2" ;;
+        --yes|-y)      ASSUME_YES=1 ;;
+        -h|--help)     awk 'NR>1{ if(/^#/){sub(/^# ?/,""); print} else exit }' "$0"; exit 0 ;;
+        *) die "Unknown option: $1 (try --help)" ;;
+    esac
+    shift
+done
 
-# --uninstall flag: removes everything installed by this script and the MOK key from firmware
-[[ "${1:-}" == "--uninstall" ]] && uninstall && exit 0
-
-# --phase2 flag: invoked automatically by the post-reboot service
-[[ "${1:-}" == "--phase2" ]] && set_phase "2"
+case "$ACTION" in
+    uninstall) uninstall; exit 0 ;;
+    status)    cmd_status; exit 0 ;;
+    hook)      run_kernel_hook "${HOOK_ARGS[0]:-}" ;;
+esac
 
 echo
-echo "┌────────────────────────────────────────────────┐"
-echo "│         Intel IPU6 Camera Fix for Ubuntu       │"
-echo "│  Questions: Eduardo Ruiz Duarte                 │"
-echo "│  toorandom@gmail.com                           │"
-echo "└────────────────────────────────────────────────┘"
-echo
+echo "┌──────────────────────────────────────────────────┐"
+echo "│          Intel IPU6 Camera Fix for Ubuntu        │"
+echo "│  Questions: Eduardo Ruiz Duarte                  │"
+echo "│  toorandom@gmail.com                             │"
+echo "└──────────────────────────────────────────────────┘"
+
+KVER=$(uname -r)
+section "Environment"
+echo "  Kernel         : $KVER"
+echo "  Ubuntu         : $(lsb_release -ds 2>/dev/null || echo '?')"
+echo "  /dev/ipu-psys0 : $([[ -e /dev/ipu-psys0 ]] && echo present || echo missing)"
 
 install_packages
+install_psys_guard
+configure_boot_loading
 
-# ── No Secure Boot: single-pass setup ─────────────────────────────────────────
-if ! secure_boot_on; then
-    section "Secure Boot: disabled"
-    configure_boot_loading
-    configure_v4l2relayd
-    load_and_start
-    echo
-    echo "  Done. Camera is ready."
-    exit 0
-fi
+# ── Secure Boot: sign v4l2loopback before loading it ─────────────────────────
+if secure_boot_on; then
+    info "Secure Boot: enabled"
+    phase=$(get_phase)
 
-info "Secure Boot: enabled"
-
-# ── Secure Boot: phased setup ─────────────────────────────────────────────────
-current_phase=$(get_phase)
-
-# ── PHASE 1: Enroll MOK key, schedule phase 2, reboot ────────────────────────
-if [[ "$current_phase" == "1" ]]; then
-    section "Phase 1 — MOK key enrollment"
-
-    generate_mok_keys
-
-    if key_enrolled; then
-        ok "Key already enrolled in firmware — jumping to phase 2"
-        set_phase "2"
-        exec bash "$0"
-    fi
-
-    echo
-    info "Enrolling key with MOK..."
-    echo "  You will be prompted for a temporary password."
-    echo "  Write it down — you will enter it at the MOK Manager screen after reboot."
-    echo
-    mokutil --import "$MOK_DER"
-
-    set_phase "2"
-
-    echo
-    echo "  ┌─────────────────────────────────────────────────────────┐"
-    echo "  │  REBOOT REQUIRED — follow these steps at the blue screen│"
-    echo "  │                                                         │"
-    echo "  │    1.  Enroll MOK                                       │"
-    echo "  │    2.  Continue                                         │"
-    echo "  │    3.  Yes                                              │"
-    echo "  │    4.  Enter the password you just created              │"
-    echo "  │    5.  Reboot                                           │"
-    echo "  │                                                         │"
-    echo "  │  After reboot, run this script again as root to finish  │"
-    echo "  │  setup of camera:                                       │"
-    echo "  │      sudo bash $0                                       │"
-    echo "  └─────────────────────────────────────────────────────────┘"
-    echo
-    read -rp "  Reboot now? [Y/n]: " ans
-    if [[ "${ans:-y}" =~ ^[nN]$ ]]; then
-        echo
-        info "Reboot postponed. When ready:"
-        info "  1. Reboot and complete MOK enrollment at the blue screen"
-        info "  2. Run this script again as root: sudo bash ${INSTALLED_SCRIPT}"
-        echo
-        exit 0
-    fi
-    reboot
-
-# ── PHASE 2: Sign, configure, load ────────────────────────────────────────────
-elif [[ "$current_phase" == "2" ]]; then
-    section "Phase 2 — Signing and configuring"
-
-    # Clear the phase file on entry — if something fails, the next run
-    # will fall back to phase 1 automatically without manual cleanup.
-    rm -f "$PHASE_FILE"
-
-    if ! key_enrolled; then
-        echo
-        warn "MOK key not found in firmware."
-        warn "Did you complete all steps in MOK Manager at boot?"
-        warn "To retry from scratch just run: sudo bash $0"
-        exit 1
-    fi
-
-    sign_module "$(uname -r)"
-    configure_boot_loading
-    install_signing_service
-    configure_v4l2relayd
-    load_and_start
-
-    echo
-    echo "  Done. Camera is ready and will work after every kernel update."
-
-    # ── Detect camera device and suggest test command ─────────────────────────
-    cam_dev=$(grep -rl "$CARD_LABEL" /sys/devices/virtual/video4linux/*/name 2>/dev/null \
-              | head -1 | cut -d/ -f6 || echo "")
-    if [[ -z "$cam_dev" ]]; then
-        cam_dev=$(ls /dev/video* 2>/dev/null | head -1 | grep -oP 'video\d+' || echo "")
-    fi
-
-    if [[ -n "$cam_dev" ]]; then
-        echo
-        echo "  Camera device detected: /dev/${cam_dev}"
-        if command -v ffplay &>/dev/null; then
-            echo "  Test it with:"
-            echo "      ffplay -f v4l2 -i /dev/${cam_dev}"
+    if [[ "$phase" == "1" ]]; then
+        section "Phase 1 — MOK key enrollment"
+        generate_mok_keys
+        if key_enrolled; then
+            ok "Key already enrolled — continuing"
+            set_phase "2"
         else
-            echo "  To test the camera, install ffmpeg and run:"
-            echo "      sudo apt install ffmpeg"
-            echo "      ffplay -f v4l2 -i /dev/${cam_dev}"
+            echo
+            info "Enrolling key with MOK..."
+            echo "  You will be asked for a temporary password. Write it down:"
+            echo "  you must type it at the blue MOK Manager screen after rebooting."
+            echo
+            mokutil --import "$MOK_DER"
+            set_phase "2"
+            echo
+            echo "  ┌──────────────────────────────────────────────────────────┐"
+            echo "  │  REBOOT REQUIRED — at the blue MOK Manager screen:       │"
+            echo "  │    1. Enroll MOK   2. Continue   3. Yes                  │"
+            echo "  │    4. Enter the password you just created   5. Reboot    │"
+            echo "  │                                                          │"
+            echo "  │  Then run this script again to finish.                   │"
+            echo "  └──────────────────────────────────────────────────────────┘"
+            echo
+            if confirm "Reboot now?"; then reboot; fi
+            info "Reboot postponed. Re-run this script after enrolling the key."
+            exit 0
         fi
     fi
 
+    section "Phase 2 — Signing"
+    rm -f "$PHASE_FILE"
+    key_enrolled || die "MOK key not enrolled in firmware. Did you finish the blue screen? Re-run to retry."
+    sign_module "$KVER"
+    install_signing_service
 else
-    die "Unknown phase '${current_phase}'. Reset with: sudo rm ${PHASE_FILE}"
+    info "Secure Boot: disabled — no module signing needed"
 fi
+
+load_module
+install_kernel_hook
+
+if setup_pipeline; then
+    CAM=$(camera_device || echo "video?")
+    echo
+    section "Done"
+    ok "Camera is live at /dev/${CAM}"
+    echo "  Pipeline : $(current_source)"
+    echo
+    echo "  Test it with:"
+    echo "      ffplay -f v4l2 -i /dev/${CAM}"
+    echo
+    echo "  Works in any app that reads /dev/videoN, Zoom included."
+    exit 0
+fi
+
+echo
+warn "No pipeline produced frames on this kernel."
+warn "Run 'sudo bash $0 --status' for a full diagnosis."
+if [[ ! -e /dev/ipu-psys0 ]]; then
+    warn "/dev/ipu-psys0 is missing, so the Intel HAL cannot work here."
+    warn "Try the libcamera pipeline instead:"
+    warn "    sudo apt install gstreamer1.0-libcamera libcamera-ipa libcamera-tools"
+    warn "    sudo bash $0 --libcamera"
+fi
+exit 1
