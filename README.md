@@ -156,6 +156,63 @@ Usually it recovers on its own; the freeze is what happens when it does not.
 
 ---
 
+## Hibernation will kill the camera
+
+Worth knowing before you configure `suspend-then-hibernate`: on this hardware
+**the camera does not survive hibernation**. Plain suspend (s2idle) is fine —
+the chip stays powered — but after a hibernate/resume cycle the camera is dead
+until the next reboot. The fingerprint reader usually goes down with it.
+
+This was traced all the way down, and it is not fixable from the OS:
+
+| Layer | What happens | Fixable? |
+|---|---|---|
+| VSC firmware is lost on power off | `vsc-tp: wakeup firmware failed ret: -110` | yes, in `mei_vsc` |
+| mei-csi is recreated without its fwnode | `mei-csi probed without device fwnode!` | yes, in `ivsc_csi` |
+| Sensor loses its graph endpoint | `ov02c10: failed to check hwcfg: -517` | yes, same place |
+| **Sensor is left unpowered** | `ov02c10: failed to find sensor: -5` (EIO) | **no** |
+
+The first three are software and can be patched. The last one is not: the
+sensor hangs off the VSC, and only the VSC firmware can power it back up —
+something it only does during a full initialisation, which happens at boot.
+
+Reloading the stack does not help either, because **it cannot be unloaded**:
+
+```
+modprobe: FATAL: Module intel_ipu6_isys is in use.   (refcnt 6)
+modprobe: FATAL: Module intel_ipu6     is in use.   (refcnt 9)
+modprobe: FATAL: Module ov02c10        is in use.   (refcnt 5)
+```
+
+Those refcounts are held by registered V4L2/media devices, which are only
+released by the module's `remove` — which you cannot reach without unloading
+the module. Unbinding the PCI and SPI parents does not drop them either. The
+IPU6 driver is written assuming it is never unloaded.
+
+**So configure the lid to suspend, not hibernate:**
+
+```ini
+# /etc/systemd/logind.conf.d/10-lid.conf
+[Login]
+HandleLidSwitch=suspend
+HandleLidSwitchExternalPower=suspend
+```
+
+Hibernation itself works fine otherwise, and barely drains the battery
+(~0.3%/hour measured). If your firmware aborts it instantly — entering S4 and
+waking up in the same second, never writing the image — your laptop is likely
+Modern Standby only, and this fixes it:
+
+```ini
+# /etc/systemd/sleep.conf.d/20-hibernate-mode.conf
+[Sleep]
+HibernateMode=shutdown
+```
+
+Just remember you will need a reboot afterwards if you want the camera back.
+
+---
+
 ## What the script does, manually
 
 If you would rather not trust the script, this is exactly what it does.
