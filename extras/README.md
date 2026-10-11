@@ -36,3 +36,21 @@ fix-camera --status   # diagnose only
 
 It finds the camera **by label**, never by assuming `/dev/video0`: the number changes
 between boots, and hardcoding it is how you end up with "Link has been severed".
+
+## `voltear-camara` — fix the image when it comes up upside down
+
+The service that sets the sensor's flips can lose a race with `v4l2-relayd`, which starts
+about 100 ms later and configures the sensor itself. When that happens the image comes up
+upside down and there is nothing to debug — you just want it fixed:
+
+```bash
+voltear-camara            # toggle
+voltear-camara --on       # upright
+voltear-camara --status   # just tell me
+```
+
+It finds the sensor subdev **by name**, because the number changes on every boot and every
+post-S4 re-probe. No sudo needed if you are in the `video` group. An app that already has
+the camera open keeps the old framing until it reopens the device.
+
+Installed by `ipu6-hibernate-fix.sh`.

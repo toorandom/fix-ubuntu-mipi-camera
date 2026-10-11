@@ -162,47 +162,12 @@ install_all() {
     ok "overlay instalado"
 
     say "Orientación del sensor (montado a 180°)"
-    install -m 0755 /dev/stdin /usr/local/sbin/ipu6-sensor-orientation <<'ORIENT'
-#!/bin/bash
-# Pone los flips del sensor Y LOS VERIFICA en bucle: ipu_bridge hace un
-# re-probe diferido justo después del evento udev ("ov02c10 bound after
-# delay") y ese bind reinicializa los registros, borrando una escritura única.
-name="${1:-}"; [ -n "$name" ] || exit 0
-dev="/dev/$name"
-flips_ok() {
-    local out; out=$(v4l2-ctl -d "$dev" --list-ctrls 2>/dev/null) || return 1
-    grep -q 'horizontal_flip.*value=1' <<<"$out" &&
-    grep -q 'vertical_flip.*value=1'   <<<"$out"
-}
-for _ in $(seq 1 25); do
-    [ -e "$dev" ] && v4l2-ctl -d "$dev" --list-ctrls 2>/dev/null \
-        | grep -q horizontal_flip && break
-    sleep 0.2
-done
-[ -e "$dev" ] || exit 0
-estable=0
-for _ in $(seq 1 40); do
-    flips_ok || { timeout 5 v4l2-ctl -d "$dev" \
-                    --set-ctrl=horizontal_flip=1,vertical_flip=1 2>/dev/null
-                  estable=0; }
-    if flips_ok; then
-        estable=$((estable + 1))
-        [ "$estable" -ge 3 ] && exit 0
-    fi
-    sleep 0.5
-done
-exit 0
-ORIENT
+    install -m 0755 "$SRC/hibernate/ipu6-sensor-orientation" \
+        /usr/local/sbin/ipu6-sensor-orientation
+    install -m 0755 "$SRC/extras/voltear-camara" /usr/local/bin/voltear-camara
 
-    cat > /etc/systemd/system/ipu6-sensor-orientation@.service <<'UNIT'
-[Unit]
-Description=Fix the 180-degree mounting of the ov02c10 sensor on %i
-
-[Service]
-Type=oneshot
-TimeoutStartSec=40
-ExecStart=/usr/local/sbin/ipu6-sensor-orientation %i
-UNIT
+    install -m 0644 "$SRC/hibernate/ipu6-sensor-orientation@.service" \
+        /etc/systemd/system/ipu6-sensor-orientation@.service
 
     # Por servicio y no por RUN+=: udev mata los RUN largos, y el nodo /dev
     # todavía no existe cuando se procesa el evento.

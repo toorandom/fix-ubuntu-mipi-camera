@@ -1,0 +1,7 @@
+[Unit]
+Description=Corrige la orientación 180° del sensor ov02c10 en %i
+
+[Service]
+Type=oneshot
+TimeoutStartSec=60
+ExecStart=/usr/local/sbin/ipu6-sensor-orientation %i

@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Voltea la imagen de la cámara IPU6 (sensor ov02c10, montado a 180°).
+#
+#   voltear-camara            alterna: si está al revés la endereza y viceversa
+#   voltear-camara --on       la endereza (flips a 1)
+#   voltear-camara --off      la deja como la da el sensor (flips a 0)
+#   voltear-camara --status   solo informa
+#
+# El número del subdev cambia en cada arranque y en cada re-probe tras
+# hibernar, así que SIEMPRE se busca por nombre, nunca se asume uno fijo.
+set -uo pipefail
+
+dev=""
+for d in /sys/class/video4linux/v4l-subdev*; do
+    [ -r "$d/name" ] || continue
+    if grep -q '^ov02c10' "$d/name" 2>/dev/null; then
+        dev="/dev/$(basename "$d")"
+        break
+    fi
+done
+
+if [ -z "$dev" ]; then
+    echo "No encuentro el subdev del sensor ov02c10." >&2
+    echo "La cámara puede estar caída; prueba:  fix-camera" >&2
+    exit 1
+fi
+
+leer() {
+    v4l2-ctl -d "$dev" --list-ctrls 2>/dev/null \
+      | grep -oE 'horizontal_flip.*value=[01]|vertical_flip.*value=[01]' \
+      | grep -oE 'value=[01]$' | grep -oE '[01]' | tr '\n' ' '
+}
+
+estado=$(leer)
+case "$estado" in
+    "1 1 ") actual=derecha ;;
+    "0 0 ") actual=invertida ;;
+    *)      actual="mezclada ($estado)" ;;
+esac
+
+case "${1:-}" in
+    --status)
+        echo "Sensor : $dev"
+        echo "Imagen : $actual"
+        exit 0 ;;
+    --on)   nuevo=1 ;;
+    --off)  nuevo=0 ;;
+    "")     [ "$actual" = derecha ] && nuevo=0 || nuevo=1 ;;
+    *)      echo "Uso: $(basename "$0") [--on|--off|--status]" >&2; exit 2 ;;
+esac
+
+if ! v4l2-ctl -d "$dev" --set-ctrl=horizontal_flip=$nuevo,vertical_flip=$nuevo 2>/dev/null; then
+    echo "No pude escribir en $dev (¿permisos? prueba con sudo)" >&2
+    exit 1
+fi
+
+final=$(leer)
+[ "$final" = "$([ $nuevo = 1 ] && echo '1 1 ' || echo '0 0 ')" ] \
+    && echo "Imagen $([ $nuevo = 1 ] && echo 'enderezada' || echo 'sin voltear') — $dev" \
+    || { echo "El cambio no se aplicó (quedó: $final)" >&2; exit 1; }
+
+# El cambio es inmediato, pero una app que ya tenga la cámara abierta puede
+# seguir mostrando el encuadre anterior hasta que reabra el dispositivo.
