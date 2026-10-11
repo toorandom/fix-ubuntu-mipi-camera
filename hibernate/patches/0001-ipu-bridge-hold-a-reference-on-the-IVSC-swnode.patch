@@ -2,14 +2,14 @@ From: Eduardo Ruiz Duarte <toorandom@gmail.com>
 Subject: [PATCH] media: ipu-bridge: hold a reference on the IVSC software node
 
 ipu_bridge_instantiate_ivsc() attaches the IVSC software node to the mei-csi
-device with set_secondary_fwnode() but never takes a reference on it, while the
-driver core unconditionally drops one when that device goes away.
+device with set_secondary_fwnode(), but never takes a reference on it, while
+the driver core unconditionally drops one when that device goes away.
 
 device_add() calls software_node_notify(), which does a kobject_get() on the
-swnode behind dev_fwnode(dev). device_del() calls software_node_notify_remove(),
-which does the matching kobject_put() -- and that put sits *outside* the
-"if (swnode->managed)" block, so it runs for every device whose fwnode is a
-software node, managed or not:
+swnode behind dev_fwnode(dev). device_del() calls
+software_node_notify_remove(), which does the matching kobject_put() -- and
+that put sits *outside* the "if (swnode->managed)" block, so it runs for every
+device whose fwnode is a software node, managed or not:
 
 	sysfs_remove_link(&swnode->kobj, dev_name(dev));
 	sysfs_remove_link(&dev->kobj, "software_node");
@@ -20,30 +20,44 @@ software node, managed or not:
 		kobject_put(&swnode->kobj);
 	}
 
-csi_dev is the mei-csi device, which the MEI client bus has already added by the
-time ipu_bridge_instantiate_ivsc() runs. The add-side get therefore never
+csi_dev is the mei-csi device, which the MEI client bus has already added by
+the time ipu_bridge_instantiate_ivsc() runs. The add-side get therefore never
 happens for this node, but the del-side put always does.
 
 On hardware where the MEI bus resets -- which it does on every s2idle and S4
 resume on a Dell XPS 13 9340 -- mei-csi is destroyed and recreated each cycle,
-so the node loses one reference per resume. INTC10CF-N starts at 3 (its own
-registration plus one for each of its two port children, since kobject_add() of
-a child takes a reference on the parent), so the third resume frees it.
-software_node_find_by_name() then returns NULL and isys walks into freed memory:
+so the node loses one reference per resume. INTC10CF-N starts at 3: one for its
+own registration plus one for each of its two port children, since
+kobject_add() of a child takes a reference on the parent. The third resume
+therefore frees it, software_node_find_by_name() starts returning NULL, and
+isys walks the fwnode graph into freed memory:
 
   refcount_t: addition on 0; use-after-free
-   kobject_get
-   software_node_graph_get_port_parent
-   fwnode_graph_get_port_parent
-   fwnode_graph_get_endpoint_by_id
-   isys_notifier_init [intel_ipu6_isys]
-   isys_register_devices / isys_probe
-   deferred_probe_work_func
+  WARNING: lib/refcount.c:25 at refcount_warn_saturate+0x7e/0xb0
+   kobject_get+0x94/0xb0
+   software_node_graph_get_port_parent+0x89/0xd0
+   fwnode_graph_get_port_parent+0x70/0xd0
+   fwnode_graph_get_endpoint_by_id+0x93/0x280
+   isys_notifier_init+0x92/0x180 [intel_ipu6_isys]
+   isys_register_devices+0x3c9/0x4e0 [intel_ipu6_isys]
+   isys_probe+0x3df/0x500 [intel_ipu6_isys]
+   auxiliary_bus_probe+0x4c/0x70
+   ...
+   deferred_probe_work_func+0xa5/0x110
+
+followed by an underflow and a saturate on the same kobject, and the camera
+never comes back.
 
 Take a reference so the attachment owns one, balancing the put the core will do
-when csi_dev is destroyed. On the path where the device is never destroyed this
-leaks a single kobject reference, which is what the lifetime of the node already
-assumes.
+when csi_dev is destroyed. Where csi_dev is never destroyed this leaks a single
+kobject reference, which is what the lifetime of the node already assumes.
+
+Found while making the camera survive hibernation on a Dell XPS 13 9340
+(ov02c10 behind an INTC10CF IVSC); with suspend-then-hibernate the first cycle
+burns two resumes, so the failure consistently showed up on the second
+hibernation. Tested on 7.0.0-1015-oem: two consecutive hibernations with the
+node alive throughout and no refcount warnings, where before the second one
+hung the machine.
 
 Signed-off-by: Eduardo Ruiz Duarte <toorandom@gmail.com>
 ---
@@ -52,7 +66,7 @@ Signed-off-by: Eduardo Ruiz Duarte <toorandom@gmail.com>
 
 --- a/drivers/media/pci/intel/ipu-bridge.c
 +++ b/drivers/media/pci/intel/ipu-bridge.c
-@@ -672,6 +672,15 @@ static int ipu_bridge_instantiate_ivsc(struct ipu_sensor *sensor)
+@@ -765,6 +765,15 @@
  	if (!fwnode)
  		return -ENODEV;
  
@@ -68,3 +82,5 @@ Signed-off-by: Eduardo Ruiz Duarte <toorandom@gmail.com>
  	set_secondary_fwnode(sensor->csi_dev, fwnode);
  
  	return 0;
+-- 
+2.51.0
