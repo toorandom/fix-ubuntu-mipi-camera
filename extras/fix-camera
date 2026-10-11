@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+# fix-camera — diagnostica y recupera la cámara MIPI (Intel IPU6 + v4l2-relayd)
+#
+# Síntoma que arregla: la cámara se queda congelada en el último frame; las
+# páginas web dicen "pausada" y Zoom muestra una imagen fija. Causa: un
+# "Frame sync error" del enlace CSI-2 deja el pipeline de CamHAL esperando
+# frames que nunca llegan, mientras v4l2loopback sigue sirviendo la caché.
+#
+# Uso:  fix-camera [--check] [--force] [--libcamera] [--hal]
+#         --check      solo diagnostica, no modifica nada
+#         --force      reinicia aunque la cámara parezca sana
+#         --libcamera  cambia la fuente a libcamerasrc (SoftISP, in-tree: peor
+#                      color, pero no depende del HAL de Intel ni de PSYS)
+#         --hal        vuelve a icamerasrc (ISP por hardware, mejor imagen)
+
+set -uo pipefail
+
+CHECK_ONLY=0
+FORCE=0
+SWITCH_SRC=""
+
+# Etiqueta con la que ipu6-camera-fix.sh nombra el dispositivo virtual.
+CARD_LABEL="${CARD_LABEL:-Intel MIPI Camera}"
+RELAYD_CONF=/etc/v4l2-relayd.d/default.conf
+for arg in "$@"; do
+    case "$arg" in
+        --check) CHECK_ONLY=1 ;;
+        --force) FORCE=1 ;;
+        --libcamera) SWITCH_SRC=libcamera ;;
+        --hal) SWITCH_SRC=hal ;;
+        -h|--help) awk 'NR>1{ if(/^#/){sub(/^# ?/,""); print} else exit }' "$0"; exit 0 ;;
+        *) echo "opción desconocida: $arg (usa --help)" >&2; exit 2 ;;
+    esac
+done
+
+if [ -t 1 ]; then
+    B=$(tput bold); R=$(tput sgr0)
+    RED=$(tput setaf 1); GRN=$(tput setaf 2); YEL=$(tput setaf 3)
+else
+    B=""; R=""; RED=""; GRN=""; YEL=""
+fi
+
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '%s✓%s %s\n' "$GRN" "$R" "$*"; }
+warn() { printf '%s!%s %s\n' "$YEL" "$R" "$*"; }
+bad()  { printf '%s✗%s %s\n' "$RED" "$R" "$*"; }
+hdr()  { printf '\n%s%s%s\n' "$B" "$*" "$R"; }
+
+# dmesg sin sudo si el kernel lo permite, con sudo si no
+kmsg() { dmesg -T 2>/dev/null || sudo dmesg -T 2>/dev/null; }
+
+# --- localizar el dispositivo virtual (v4l2loopback vive en .../virtual/) ---
+find_loopback() {
+    local p name
+    # Buscar primero el que lleva nuestra etiqueta: puede haber otros
+    # v4l2loopback (OBS, DroidCam) y coger el primero a ciegas apuntaría
+    # al dispositivo equivocado.
+    for p in /sys/devices/virtual/video4linux/video*; do
+        [ -e "$p" ] || continue
+        name=$(cat "$p/name" 2>/dev/null)
+        if [ "$name" = "$CARD_LABEL" ]; then
+            echo "/dev/$(basename "$p")"
+            return 0
+        fi
+    done
+    # Sin coincidencia, caer al primero disponible (comportamiento anterior).
+    for p in /sys/devices/virtual/video4linux/video*; do
+        [ -e "$p" ] || continue
+        echo "/dev/$(basename "$p")"
+        return 0
+    done
+    return 1
+}
+
+# --- unidad systemd real (es una instancia @, no el target dummy) ---
+find_unit() {
+    local u
+    u=$(systemctl list-units --no-legend --plain 'v4l2-relayd@*.service' 2>/dev/null \
+        | awk '{print $1}' | head -1)
+    echo "${u:-v4l2-relayd@default.service}"
+}
+
+# --- ¿llegan frames? devuelve 0 si sí ---
+frames_flowing() {
+    timeout 15 v4l2-ctl -d "$1" --stream-mmap --stream-count=10 \
+        --stream-to=/dev/null >/dev/null 2>&1
+}
+
+# --- cambiar la fuente del pipeline de v4l2-relayd ---
+# v4l2-relayd acepta cualquier VIDEOSRC de GStreamer, así que cambiar entre el
+# HAL de Intel y libcamera es una sola línea del fichero de configuración.
+switch_source() {
+    local mode="$1" src unit
+    case "$mode" in
+        libcamera) src="libcamerasrc" ;;
+        hal)       src="icamerasrc buffer-count=7" ;;
+        *) bad "modo desconocido: $mode"; return 1 ;;
+    esac
+    [ -f "$RELAYD_CONF" ] || { bad "No existe $RELAYD_CONF"; return 1; }
+    hdr "Cambiando la fuente a: $src"
+    sudo sed -i "s|^VIDEOSRC=.*|VIDEOSRC=${src}|" "$RELAYD_CONF" || return 1
+    grep -E '^VIDEOSRC=' "$RELAYD_CONF" | sed 's/^/    /'
+    unit=$(find_unit)
+    sudo systemctl restart "$unit" || { bad "No se pudo reiniciar $unit"; return 1; }
+    sleep 4
+    local dev; dev=$(find_loopback) || { bad "El dispositivo no reapareció"; return 1; }
+    if frames_flowing "$dev"; then
+        ok "Fuente cambiada y entregando frames en $dev"
+        [ "$mode" = libcamera ] && say "  (SoftISP: imagen más verdosa y oscura, pero no depende de PSYS)"
+        return 0
+    fi
+    bad "Tras el cambio sigue sin entregar frames."
+    return 1
+}
+
+if [ -n "$SWITCH_SRC" ]; then
+    switch_source "$SWITCH_SRC"
+    exit $?
+fi
+
+hdr "Estado actual"
+
+DEV=$(find_loopback) || {
+    bad "No existe el dispositivo virtual de v4l2loopback."
+    say "  El módulo no está cargado. Prueba:  sudo modprobe v4l2loopback"
+    say "  Si falla, revisa tu protocolo: ~/fix-ubuntu-mipi-camera"
+    exit 1
+}
+LABEL=$(cat "/sys/class/video4linux/$(basename "$DEV")/name" 2>/dev/null || echo "?")
+ok "Dispositivo: $DEV  ($LABEL)"
+
+UNIT=$(find_unit)
+if systemctl is-active --quiet "$UNIT"; then
+    SINCE=$(systemctl show -p ActiveEnterTimestamp --value "$UNIT" 2>/dev/null)
+    ok "Servicio $UNIT activo (desde ${SINCE:-?})"
+    RELAYD_UP=1
+else
+    bad "Servicio $UNIT NO está activo"
+    RELAYD_UP=0
+fi
+
+# --- ¿alguien tiene la cámara abierta? (relayd no cuenta: es el dueño legítimo) ---
+CLIENTS=$(sudo fuser "$DEV" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$' || true)
+OTHER=""
+for pid in $CLIENTS; do
+    cmd=$(ps -o comm= -p "$pid" 2>/dev/null) || continue
+    [ "$cmd" = "v4l2-relayd" ] && continue
+    OTHER+="    PID $pid  $cmd"$'\n'
+done
+if [ -n "$OTHER" ]; then
+    warn "Hay aplicaciones usando la cámara ahora mismo:"
+    printf '%s' "$OTHER"
+    say "  Ciérralas antes de reiniciar, o el arreglo no servirá de nada."
+else
+    ok "Ninguna aplicación tiene la cámara abierta"
+fi
+
+# --- señales de cuelgue ---
+TIMEOUTS=$(journalctl -b _COMM=v4l2-relayd --since "-2 min" --no-pager 2>/dev/null \
+           | grep -c 'time out' || true)
+if [ "${TIMEOUTS:-0}" -gt 0 ]; then
+    bad "CamHAL: $TIMEOUTS timeouts de frame en los últimos 2 minutos"
+    say "  → esto es el cuelgue: espera frames que nunca llegan"
+else
+    ok "CamHAL: sin timeouts recientes"
+fi
+
+WEDGED=$(kmsg | grep -cE 'stream stop time out|stream close error|stream start time out|buffer time out|failed to (stop|start) stream' || true)
+if [ "${WEDGED:-0}" -gt 0 ]; then
+    warn "Historial: $WEDGED cuelgue(s) de stream en el kernel desde el arranque"
+    say "  (acumulado, no significa que esté colgada ahora)"
+fi
+
+SYNC=$(kmsg | grep -cE 'csi2.*Frame sync error' || true)
+if [ "${SYNC:-0}" -gt 0 ]; then
+    warn "Historial: $SYNC 'Frame sync error' del enlace CSI-2 — últimos:"
+    kmsg | grep -E 'csi2.*Frame sync error' | tail -2 | sed 's/^/    /'
+    say "  Normalmente se recupera solo. El cuelgue ocurre cuando NO lo hace."
+fi
+
+# --- veredicto ---
+hdr "Diagnóstico"
+
+NEEDS_FIX=0
+if [ "$RELAYD_UP" -eq 0 ]; then
+    bad "El servicio está parado. La cámara no funcionará en ninguna aplicación."
+    NEEDS_FIX=1
+elif [ -n "$OTHER" ]; then
+    warn "No puedo probar la captura: otra aplicación tiene el dispositivo ocupado."
+    say "  Cierra esas aplicaciones y vuelve a ejecutar 'fix-camera'."
+    [ "$FORCE" -eq 1 ] || exit 0
+    NEEDS_FIX=1
+elif frames_flowing "$DEV"; then
+    ok "La cámara ENTREGA FRAMES. Está funcionando."
+    if [ "$FORCE" -eq 0 ]; then
+        say ""
+        say "No hay nada que arreglar. Si una aplicación concreta la ve congelada,"
+        say "el problema está en esa aplicación: ciérrala y vuelve a abrirla."
+        exit 0
+    fi
+    warn "--force: reinicio de todas formas."
+    NEEDS_FIX=1
+else
+    bad "La cámara NO entrega frames: está congelada."
+    say "  v4l2loopback sigue publicando el último frame capturado,"
+    say "  por eso las aplicaciones muestran una imagen fija en vez de error."
+    NEEDS_FIX=1
+fi
+
+if [ "$CHECK_ONLY" -eq 1 ]; then
+    say ""
+    say "(--check: no he modificado nada)"
+    [ "$NEEDS_FIX" -eq 1 ] && say "Ejecuta 'fix-camera' sin --check para reiniciar el pipeline."
+    exit 0
+fi
+
+# --- arreglo ---
+hdr "Reiniciando el pipeline"
+say "sudo systemctl restart $UNIT"
+if ! sudo systemctl restart "$UNIT"; then
+    bad "El reinicio falló. Revisa:  systemctl status $UNIT"
+    exit 1
+fi
+sleep 4
+
+DEV=$(find_loopback) || { bad "El dispositivo no reapareció tras el reinicio."; exit 1; }
+ok "Servicio reiniciado (dispositivo: $DEV)"
+
+# --- verificación ---
+hdr "Verificando"
+FPS=$(timeout 30 v4l2-ctl -d "$DEV" --stream-mmap --stream-count=120 2>&1 \
+      | grep -oE '[0-9]+\.[0-9]+ fps' | tail -1)
+
+if [ -n "$FPS" ]; then
+    ok "Cámara operativa — $FPS"
+    say ""
+    say "Ya puedes abrir Zoom o una página de webcam."
+    say "En Zoom quizá tengas que re-seleccionar '$LABEL' en ajustes:"
+    say "el dispositivo desapareció y reapareció durante el reinicio."
+    exit 0
+fi
+
+bad "Sigue sin entregar frames tras el reinicio."
+say ""
+say "El estado colgado está en el kernel, no en userspace. Siguiente paso,"
+say "recargar los módulos del IPU6 (cierra todo lo que use la cámara antes):"
+say ""
+say "    sudo systemctl stop $UNIT"
+say "    sudo modprobe -r v4l2loopback intel_ipu6_psys intel_ipu6_isys"
+say "    sudo modprobe intel_ipu6_isys intel_ipu6_psys v4l2loopback"
+say "    sudo systemctl start $UNIT"
+say ""
+say "Si eso tampoco funciona, cambia al pipeline de libcamera (SoftISP,"
+say "in-tree: no depende del HAL de Intel ni de /dev/ipu-psys0):"
+say ""
+say "    fix-camera --libcamera"
+say ""
+say "y para volver al ISP por hardware cuando se recupere:"
+say ""
+say "    fix-camera --hal"
+say ""
+say "Si nada de esto funciona, reinicia el equipo."
+exit 1

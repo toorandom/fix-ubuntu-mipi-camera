@@ -1,0 +1,14 @@
+# Ocultar los nodos crudos del IPU6 ISYS a las aplicaciones.
+#
+# El IPU6 expone ~48 /dev/videoN ("Intel IPU6 ISYS Capture N") que son las
+# salidas en bruto del sensor: no entregan imagen usable por sí solas, hace
+# falta el pipeline de v4l2-relayd, que publica el resultado en el dispositivo
+# virtual "Intel MIPI Camera". Pero todos se anuncian con
+# ID_V4L_CAPABILITIES=:capture:, así que Zoom y los navegadores los listan
+# como si fueran cámaras y el usuario acaba eligiendo una que da pantalla
+# negra.
+#
+# Vaciar la capacidad sólo cambia el metadato que leen las aplicaciones; los
+# nodos siguen existiendo y funcionando para icamerasrc/libcamhal, que los
+# abren por ruta.
+SUBSYSTEM=="video4linux", ATTR{name}=="Intel IPU6 ISYS Capture*", ENV{ID_V4L_CAPABILITIES}=""

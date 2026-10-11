@@ -279,6 +279,25 @@ The full write-up, with the timelines and the reference arithmetic, is in
 
 ---
 
+## Reinstalled your system? Start here
+
+Everything needed is in this repo:
+
+```bash
+git clone https://github.com/toorandom/fix-ubuntu-mipi-camera
+cd fix-ubuntu-mipi-camera
+sudo bash ipu6-camera-fix.sh        # camera working (Secure Boot: run twice, see above)
+sudo bash ipu6-hibernate-fix.sh     # survive hibernation
+sudo cp extras/70-ipu6-hide-raw-nodes.rules /etc/udev/rules.d/   # hide ~48 fake cameras
+install -m 0755 extras/fix-camera ~/.local/bin/                  # recover a frozen image
+cp -r skills/ipu6-camera ~/.claude/skills/                       # for your coding agent
+sudo reboot
+```
+
+Then verify, and test hibernation **twice** — see [Testing it honestly](#testing-it-honestly).
+
+---
+
 ## When the image freezes
 
 A different failure, with a different fix. The CSI-2 link throws a `Frame sync error`,
