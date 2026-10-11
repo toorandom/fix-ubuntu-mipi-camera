@@ -114,6 +114,10 @@ sudo bash ipu6-camera-fix.sh --hal         # force the Intel HAL pipeline
 sudo bash ipu6-camera-fix.sh --uninstall   # remove everything
 ```
 
+That gets the camera working. If you also hibernate — or if closing the lid hangs the
+machine — run [`ipu6-hibernate-fix.sh`](#hibernation) afterwards; it is a separate
+problem with a separate fix.
+
 `--status` prints the full picture, including whether frames are actually flowing:
 
 ```
