@@ -1,0 +1,10 @@
+GPL-2.0
+
+Everything under hibernate/ is GPL-2.0, NOT the MIT of the rest of this
+repository. It is derived from Linux kernel source (drivers/media/pci/intel,
+drivers/misc/mei, drivers/media/i2c) and from the GPL-2.0 "mei-vsc-hibernate"
+DKMS overlay, so it keeps the kernel's licence. Every source file carries its
+original SPDX-License-Identifier; those headers are authoritative.
+
+See the Linux kernel's COPYING for the full text of the GNU General Public
+License version 2.

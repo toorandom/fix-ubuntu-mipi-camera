@@ -1,0 +1,20 @@
+Apply to the ov02e10 source that actually loads (Ubuntu in-tree or ipu6-drivers DKMS).
+Without this, i2c_new_client_device(..., type="ov02e10") does not match (ACPI HID only).
+
+--- a/drivers/media/i2c/ov02e10.c
++++ b/drivers/media/i2c/ov02e10.c
+@@ - MODULE_DEVICE_TABLE(acpi, ov02e10_acpi_ids);
+ 
++static const struct i2c_device_id ov02e10_id[] = {
++	{ "ov02e10", 0 },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, ov02e10_id);
++
+ static struct i2c_driver ov02e10_i2c_driver = {
+ 	.driver = {
+ 		   .name = "ov02e10",
+ 		   .pm = &ov02e10_pm_ops,
+ 		   .acpi_match_table = ov02e10_acpi_ids,
+ 		    },
++	.id_table = ov02e10_id,

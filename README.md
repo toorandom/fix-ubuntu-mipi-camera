@@ -140,6 +140,97 @@ this setup and will make you think the fix failed.
 
 ---
 
+## Hibernation
+
+A separate problem with a separate fix, in `ipu6-hibernate-fix.sh`.
+
+Hibernation powers the machine off. The IVSC (Intel Visual Sensing Controller) loses its
+firmware, nothing reloads it, and the camera never comes back:
+
+```
+vsc-tp spi-INTC10D0:00: wakeup firmware failed ret: -110
+ivsc_csi ...: mei-csi probed without device fwnode!
+ov02c10 ...: failed to find sensor: -5
+```
+
+Worse, on this hardware the **second** hibernation used to hang the machine outright —
+black screen, power button, no log. The first one always worked, which is what made it so
+confusing.
+
+That turned out to be **two independent bugs**, one in the kernel and one in userspace,
+and they have to be kept apart because each needs a different fix:
+
+| | Symptom | Where | Fixed by |
+|---|---|---|---|
+| **A** | crash on **resume**: `refcount_t: addition on 0` in `isys_probe`, IVSC node freed | kernel | the patch below |
+| **B** | hang on the way **into** S4, stuck at `Freezing user space processes` | userspace | removing a legacy sleep hook |
+
+Fixing A alone was not enough: the resume that used to die went through clean, and the
+machine still hung — that was B, found afterwards. The patch does **not** fix B.
+
+```bash
+sudo bash ipu6-hibernate-fix.sh            # install
+sudo bash ipu6-hibernate-fix.sh --status   # diagnose, change nothing
+sudo bash ipu6-hibernate-fix.sh --uninstall
+```
+
+It installs a DKMS package (`hibernate/`) that rebuilds itself on every kernel upgrade,
+configures `suspend-then-hibernate` on the lid, and fixes the sensor's 180° mounting.
+
+### A — why the resume crashed
+
+An unbalanced reference count on the IVSC software node. The driver core pairs a
+`kobject_get()` in `software_node_notify()` (at `device_add()`) with a `kobject_put()` in
+`software_node_notify_remove()` (at `device_del()`) — but **that put is unconditional**,
+sitting outside the `if (swnode->managed)` block that guards the second, extra put.
+
+The fwnode is attached to `mei-csi` *after* the MEI bus has already added it, so the
+add-side get never happens — while the del-side put always does. The MEI bus destroys and
+recreates `mei-csi` on every resume, so the node loses one reference per cycle.
+`INTC10CF-N` starts at 3 (itself plus its two port children), so the third resume frees
+it, and `isys` walks the fwnode graph into freed memory:
+
+```
+refcount_t: addition on 0; use-after-free
+ kobject_get / software_node_graph_get_port_parent
+ fwnode_graph_get_endpoint_by_id
+ isys_notifier_init [intel_ipu6_isys]
+```
+
+With `suspend-then-hibernate` the first cycle burns two resumes (the s2idle leg plus the
+S4 resume), so the second cycle's first resume is the third. Hence "the second
+hibernation".
+
+`ipu_bridge_instantiate_ivsc()` is upstream code, so the missing get is an upstream bug
+that only shows on hardware where the MEI bus resets:
+[`hibernate/patches/0001-ipu-bridge-hold-a-reference-on-the-IVSC-swnode.patch`](hibernate/patches/0001-ipu-bridge-hold-a-reference-on-the-IVSC-swnode.patch).
+
+### B — the sleep hook that hung the freeze, and two traps
+
+**`systemd-sleep` runs every executable file in `/usr/lib/systemd/system-sleep/`,
+regardless of its extension.** Renaming a hook to `something.disabled` does not disable
+it. A leftover hook doing `unbind`/`bind` of vsc-tp and the IPU6 PCI device was still
+running there and hanging the freeze. Check the `+x` bit, not the name.
+
+**A hang at `Freezing user space processes` does not mean the kernel died there.**
+journald is one of the processes frozen at that step, so the log always stops at that
+line, hang or no hang.
+
+### Testing it honestly
+
+A plain `systemctl suspend` proves nothing — on a clean boot it does not recreate
+`mei-csi` at all. `rtcwake` is worse: it bypasses the `systemd-sleep` hooks entirely and
+can wedge the MEI stack (`mei mei1: device disabled`), which then needs a **full power
+off**, since a warm reboot does not reset the VSC firmware.
+
+The only valid test is the real one: close the lid, let it hibernate, open it, verify —
+**and do it twice**. The failure was always on the second cycle.
+
+The full write-up, with the timelines and the reference arithmetic, is in
+[`hibernate/README.md`](hibernate/README.md).
+
+---
+
 ## When the image freezes
 
 A different failure, with a different fix. The CSI-2 link throws a `Frame sync error`,
@@ -156,52 +247,45 @@ Usually it recovers on its own; the freeze is what happens when it does not.
 
 ---
 
-## Hibernation will kill the camera
+## What hibernation actually breaks
 
-Worth knowing before you configure `suspend-then-hibernate`: on this hardware
-**the camera does not survive hibernation**. Plain suspend (s2idle) is fine —
-the chip stays powered — but after a hibernate/resume cycle the camera is dead
-until the next reboot. The fingerprint reader usually goes down with it.
+> **Earlier versions of this README said the camera could not survive hibernation and
+> that you should set the lid to plain suspend. That was wrong** — see
+> [Hibernation](#hibernation) above. The analysis below was right about three layers and
+> wrong about the fourth; it is kept because the reasoning is still useful.
 
-This was traced all the way down, and it is not fixable from the OS:
+Four things break when the machine powers off. The original diagnosis was:
 
-| Layer | What happens | Fixable? |
-|---|---|---|
-| VSC firmware is lost on power off | `vsc-tp: wakeup firmware failed ret: -110` | yes, in `mei_vsc` |
-| mei-csi is recreated without its fwnode | `mei-csi probed without device fwnode!` | yes, in `ivsc_csi` |
-| Sensor loses its graph endpoint | `ov02c10: failed to check hwcfg: -517` | yes, same place |
-| **Sensor is left unpowered** | `ov02c10: failed to find sensor: -5` (EIO) | **no** |
+| Layer | What happens | Verdict then | Verdict now |
+|---|---|---|---|
+| VSC firmware lost on power off | `vsc-tp: wakeup firmware failed ret: -110` | fixable in `mei_vsc` | fixed |
+| mei-csi recreated without its fwnode | `mei-csi probed without device fwnode!` | fixable in `ivsc_csi` | fixed |
+| Sensor loses its graph endpoint | `ov02c10: failed to check hwcfg: -517` | fixable | fixed |
+| Sensor appears unpowered | `ov02c10: failed to find sensor: -5` (EIO) | **hardware, hopeless** | **fixed** |
 
-The first three are software and can be patched. The last one is not: the
-sensor hangs off the VSC, and only the VSC firmware can power it back up —
-something it only does during a full initialisation, which happens at boot.
+The fourth was not a power problem at all. After S4 there is no ACPI i2c client for the
+sensor and the ACPI one cannot be recreated, so the fix is to instantiate a **non-ACPI
+i2c client whose primary fwnode is the software node**, and give `ov02c10` an
+`i2c_device_id` so it matches that client. `-5` was the old, dead client talking to
+nothing.
 
-Reloading the stack does not help either, because **it cannot be unloaded**:
+What *was* true: **the stack cannot be unloaded and reloaded**, so that is not a way out.
 
 ```
 modprobe: FATAL: Module intel_ipu6_isys is in use.   (refcnt 6)
-modprobe: FATAL: Module intel_ipu6     is in use.   (refcnt 9)
-modprobe: FATAL: Module ov02c10        is in use.   (refcnt 5)
+modprobe: FATAL: Module intel_ipu6      is in use.   (refcnt 9)
+modprobe: FATAL: Module ov02c10         is in use.   (refcnt 5)
 ```
 
-Those refcounts are held by registered V4L2/media devices, which are only
-released by the module's `remove` — which you cannot reach without unloading
-the module. Unbinding the PCI and SPI parents does not drop them either. The
-IPU6 driver is written assuming it is never unloaded.
+Those refcounts are held by registered V4L2/media devices, released only by the module's
+`remove` — which you cannot reach without unloading it. Unbinding the PCI and SPI parents
+does not drop them either. The IPU6 driver assumes it is never unloaded. Everything has
+to be repaired in place, which is what the overlay does.
 
-**So configure the lid to suspend, not hibernate:**
-
-```ini
-# /etc/systemd/logind.conf.d/10-lid.conf
-[Login]
-HandleLidSwitch=suspend
-HandleLidSwitchExternalPower=suspend
-```
-
-Hibernation itself works fine otherwise, and barely drains the battery
-(~0.3%/hour measured). If your firmware aborts it instantly — entering S4 and
-waking up in the same second, never writing the image — your laptop is likely
-Modern Standby only, and this fixes it:
+Also still true: hibernation barely drains the battery (~0.3%/hour measured), and if
+yours aborts instantly — entering S4 and waking in the same second, never writing the
+image — the laptop is Modern Standby only (`/sys/power/mem_sleep` offers just `[s2idle]`,
+no `deep`) and needs:
 
 ```ini
 # /etc/systemd/sleep.conf.d/20-hibernate-mode.conf
@@ -209,7 +293,7 @@ Modern Standby only, and this fixes it:
 HibernateMode=shutdown
 ```
 
-Just remember you will need a reboot afterwards if you want the camera back.
+`ipu6-hibernate-fix.sh` sets that for you.
 
 ---
 
@@ -313,6 +397,9 @@ working, no matter how healthy `systemctl status` looks.
 - Both pipelines verified end to end: `icamerasrc` (hardware ISP) and `libcamerasrc`
   (software ISP)
 - Also previously tested on Ubuntu 24.04 with kernel 6.8
+- Hibernation verified 2026-10-11 on kernel `7.0.0-1015-oem`: two consecutive
+  hibernations in one boot, camera working and correctly oriented after each resume,
+  no `refcount_t` warnings and the IVSC software node alive throughout
 
 Originally written after finally getting the camera working by hand; I used vibe coding
 to help turn it into a program. Read it before running it, and use it at your own risk.
@@ -320,6 +407,15 @@ to help turn it into a program. Read it before running it, and use it at your ow
 ---
 
 ## License
+
+MIT — for `ipu6-camera-fix.sh`, `ipu6-hibernate-fix.sh` and this README.
+
+**`hibernate/` is GPL-2.0**, not MIT: it is derived from Linux kernel source and from the
+GPL-2.0 `mei-vsc-hibernate` DKMS overlay by a third party (see
+[`hibernate/README.md`](hibernate/README.md) for credit and provenance). Each source file
+carries its original SPDX header, and those are authoritative.
+
+### Original MIT terms
 
 MIT
 
