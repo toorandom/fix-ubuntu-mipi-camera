@@ -215,6 +215,34 @@ RULE
     udevadm control --reload-rules
     ok "regla udev + servicio instalados"
 
+    say "Aviso automático tras un upgrade de kernel"
+    # El fallo tras un upgrade es silencioso: arrancas, nada se queja, y solo
+    # te enteras al volver de hibernar. De ahí dos avisos: uno en la salida de
+    # apt y otro en el escritorio al iniciar sesión.
+    install -m 0755 "$SRC/hibernate/ipu6-camera-healthcheck" \
+        /usr/local/sbin/ipu6-camera-healthcheck
+    install -m 0755 "$SRC/hibernate/ipu6-camera-notify" \
+        /usr/local/bin/ipu6-camera-notify
+    install -m 0755 "$SRC/hibernate/zy-ipu6-hibernate-check" \
+        /etc/kernel/postinst.d/zy-ipu6-hibernate-check
+    install -m 0644 "$SRC/hibernate/ipu6-camera-healthcheck.service" \
+        /etc/systemd/user/ipu6-camera-healthcheck.service
+    systemctl daemon-reload
+    # El servicio es de usuario (necesita el bus de sesión para notify-send),
+    # así que se habilita para quien de verdad usa el escritorio.
+    local u
+    u=$(loginctl list-users --no-legend 2>/dev/null \
+        | awk '$2 != "root" {print $2; exit}')
+    if [[ -n "$u" ]]; then
+        sudo -u "$u" XDG_RUNTIME_DIR="/run/user/$(id -u "$u")" \
+            systemctl --user enable ipu6-camera-healthcheck.service 2>/dev/null \
+            && ok "aviso de escritorio activado para $u"
+    else
+        warn "sin sesión gráfica; actívalo luego con:"
+        echo "         systemctl --user enable --now ipu6-camera-healthcheck.service"
+    fi
+    ok "hook de apt instalado"
+
     say "Suspensión: tapa = suspend-then-hibernate"
     mkdir -p /etc/systemd/logind.conf.d /etc/systemd/sleep.conf.d
     cat > /etc/systemd/logind.conf.d/10-lid-suspend-then-hibernate.conf <<'CONF'
@@ -266,6 +294,10 @@ uninstall_all() {
     say "Quitando hook, regla y servicio"
     rm -fv /usr/lib/systemd/system-sleep/mei-vsc-hibernate \
            /lib/systemd/system-sleep/mei-vsc-hibernate \
+           /etc/kernel/postinst.d/zy-ipu6-hibernate-check \
+           /usr/local/sbin/ipu6-camera-healthcheck \
+           /usr/local/bin/ipu6-camera-notify \
+           /etc/systemd/user/ipu6-camera-healthcheck.service \
            /etc/udev/rules.d/71-ipu6-sensor-orientation.rules \
            /etc/systemd/system/ipu6-sensor-orientation@.service \
            /usr/local/sbin/ipu6-sensor-orientation 2>/dev/null

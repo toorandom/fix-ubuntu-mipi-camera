@@ -177,6 +177,31 @@ sudo bash ipu6-hibernate-fix.sh --uninstall
 It installs a DKMS package (`hibernate/`) that rebuilds itself on every kernel upgrade,
 configures `suspend-then-hibernate` on the lid, and fixes the sensor's 180° mounting.
 
+### Surviving kernel upgrades
+
+This is the part that used to break every time. All three modules — `ipu-bridge`,
+`mei-vsc` and `ov02c10` — live inside one DKMS package with `AUTOINSTALL="yes"`, so
+`apt` rebuilds and re-signs them whenever a kernel is installed. `ov02c10` matters most:
+built by hand it quietly disappears with the old kernel, the stock one loads without the
+`i2c_device_id`, and the post-S4 i2c client then binds to nothing.
+
+What it cannot do is survive a kernel that changes the APIs these modules use. Then the
+DKMS build fails, `apt` carries on, and you find out when the camera does not come back
+from hibernation. So the failure is announced twice:
+
+- **during `apt`**, by `/etc/kernel/postinst.d/zy-ipu6-hibernate-check`, which runs after
+  DKMS and prints what is missing for the kernel just installed;
+- **at login**, by a desktop notification, in case the apt output scrolled past.
+
+Both call the same check, which you can also run yourself:
+
+```bash
+sudo ipu6-camera-healthcheck            # running kernel
+sudo ipu6-camera-healthcheck 6.11.0-9   # any installed kernel
+```
+
+It is silent and exits 0 when everything is in place.
+
 ### A — why the resume crashed
 
 An unbalanced reference count on the IVSC software node. The driver core pairs a

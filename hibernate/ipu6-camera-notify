@@ -1,0 +1,14 @@
+#!/bin/bash
+# Si la pila de hibernación no está completa para el kernel en marcha, avisa en
+# el escritorio. Silencioso cuando todo está bien, para no volverse ruido.
+out=$(/usr/local/sbin/ipu6-camera-healthcheck 2>/dev/null) && exit 0
+
+logger -t ipu6-camera-healthcheck "pila incompleta en $(uname -r): ${out//$'\n'/; }"
+notify-send --urgency=critical --icon=camera-web \
+    "Cámara IPU6: revisar tras el upgrade" \
+    "La pila de hibernación no está completa para $(uname -r).
+La cámara no volverá después de hibernar.
+
+$(printf '%s' "$out" | head -2)
+
+Arreglo:  sudo bash ~/fix-ubuntu-mipi-camera/ipu6-hibernate-fix.sh"
