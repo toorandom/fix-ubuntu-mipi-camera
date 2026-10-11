@@ -302,6 +302,22 @@ Then verify, and test hibernation **twice** — see [Testing it honestly](#testi
 
 ---
 
+## When the image comes up upside down
+
+The sensor is mounted at 180° and the service that corrects it can lose a race with
+`v4l2-relayd`, which starts ~100 ms later and configures the sensor itself. When that
+happens:
+
+```bash
+voltear-camara            # toggle
+voltear-camara --status   # just report
+```
+
+It finds the sensor subdev by name — the number changes on every boot and every post-S4
+re-probe — and needs no sudo if you are in the `video` group.
+
+---
+
 ## When the image freezes
 
 A different failure, with a different fix. The CSI-2 link throws a `Frame sync error`,
