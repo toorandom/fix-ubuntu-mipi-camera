@@ -11,6 +11,29 @@ that expects `/dev/videoN` can use them out of the box.
 
 ---
 
+## Handing this to an AI agent
+
+If your camera is broken and you use a coding agent (Claude Code, OpenCode, Cursor,
+Codex…), point it at this repository and let it work:
+
+```
+Fix my Intel IPU6 camera using https://github.com/toorandom/fix-ubuntu-mipi-camera
+— follow AGENTS.md in that repo.
+```
+
+[`AGENTS.md`](AGENTS.md) is a runbook, not prose: how to tell the two separate problems
+apart, what to run, and — the part that matters most — the things that look reasonable
+and are wrong. Testing a hibernation fix with `systemctl suspend` proves nothing;
+`rtcwake` skips the very hooks under test and wedges the MEI stack; `dmesg -T` reports
+wrong times after hibernation; the log always ends at `Freezing user space processes`
+because journald freezes there too. An agent without those will burn your afternoon
+rediscovering them.
+
+It also marks the steps an agent **cannot** do: only you can close the lid to test
+hibernation, enrol a Secure Boot key, or decide to reboot.
+
+---
+
 ## The problem nobody explains
 
 If your camera stopped working after a kernel upgrade, this is almost certainly why.
