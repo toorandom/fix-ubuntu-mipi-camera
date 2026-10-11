@@ -431,6 +431,13 @@ to help turn it into a program. Read it before running it, and use it at your ow
 
 ---
 
+## Claude Code skill
+
+`skills/ipu6-camera/` holds the diagnostic procedure as a Claude Code skill, including
+the approaches that look sensible and are wrong. See [`skills/README.md`](skills/README.md).
+
+---
+
 ## License
 
 MIT — for `ipu6-camera-fix.sh`, `ipu6-hibernate-fix.sh` and this README.
