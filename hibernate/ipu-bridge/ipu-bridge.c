@@ -20,6 +20,48 @@
 #include <media/ipu-bridge.h>
 #include <media/v4l2-fwnode.h>
 
+/*
+ * Interruptores para bisecar el cuelgue del 3er ciclo de hibernación, que
+ * i915 reporta como "GSC proxy component didn't bind within the expected
+ * timeout" (su espera es de 20 s). Escribibles en caliente para poder probar
+ * combinaciones sin reconstruir ni reiniciar:
+ *     /sys/module/ipu_bridge/parameters/s4_teardown
+ *     /sys/module/ipu_bridge/parameters/s4_reattach
+ * Con s4_teardown=0 la cámara no volverá tras S4; es el precio de aislar.
+ */
+static bool s4_teardown = true;
+module_param(s4_teardown, bool, 0644);
+MODULE_PARM_DESC(s4_teardown,
+		 "destruir los clientes i2c del sensor antes de S4 (bisección)");
+
+static bool s4_reattach = true;
+module_param(s4_reattach, bool, 0644);
+MODULE_PARM_DESC(s4_reattach,
+		 "reenganchar swnodes y recrear el cliente i2c tras S4 (bisección)");
+
+/*
+ * Cuánto esperar tras el resume antes de reenganchar.
+ *
+ * La bisección (2026-10-11) señaló este reenganche como causa del cuelgue en
+ * la 3ª hibernación de cada arranque: i915 se queda esperando a que el
+ * componente del GSC proxy se enlace y agota su plazo,
+ *   GT1: GSC proxy component didn't bind within the expected timeout
+ * tras lo cual la pantalla muere. Ese plazo es GSC_PROXY_INIT_TIMEOUT_MS =
+ * 20000 en drivers/gpu/drm/i915/gt/uc/intel_gsc_proxy.c.
+ *
+ * No es que lleguemos tarde: es que lo que hacemos aquí
+ * -- device_attach() sobre mei-csi, y desregistrar/crear clientes i2c, que
+ * dispara driver_deferred_probe_trigger() -- estorba al probe del que depende
+ * ese componente. Empezar pasados los 20 s le deja la pista libre.
+ *
+ * Se paga con que la cámara tarde eso en volver tras hibernar. Es ajustable
+ * en caliente para poder buscar el mínimo que funcione.
+ */
+static unsigned int s4_reattach_delay_ms = 25000;
+module_param(s4_reattach_delay_ms, uint, 0644);
+MODULE_PARM_DESC(s4_reattach_delay_ms,
+		 "ms de espera tras el resume antes de reenganchar (>20000 evita el timeout del GSC de i915)");
+
 #define ADEV_DEV(adev) ACPI_PTR(&((adev)->dev))
 
 /*
@@ -1256,8 +1298,12 @@ again:
 
 static void ipu_bridge_schedule_reattach(void)
 {
+	if (!s4_reattach) {
+		pr_err("ipu_bridge: s4_reattach=0, no se reengancha tras S4\n");
+		return;
+	}
 	mod_delayed_work(system_wq, &ipu_bridge_reattach_dwork,
-			 msecs_to_jiffies(50));
+			 msecs_to_jiffies(s4_reattach_delay_ms));
 }
 
 /*
@@ -1356,6 +1402,10 @@ static int ipu_bridge_pm_notify(struct notifier_block *nb,
 	case PM_HIBERNATION_PREPARE:
 		cancel_delayed_work_sync(&ipu_bridge_reattach_dwork);
 		cancel_delayed_work_sync(&ipu_bridge_sensor_dwork);
+		if (!s4_teardown) {
+			pr_err("ipu_bridge: s4_teardown=0, no se toca nada antes de S4\n");
+			break;
+		}
 		ipu_bridge_destroy_sensor_i2c_clients();
 		ipu_bridge_clear_sensor_acpi_secondary();
 		break;

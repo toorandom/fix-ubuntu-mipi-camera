@@ -4,7 +4,7 @@
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")" && pwd)"
 NAME=mei-vsc-hibernate
-VER=1.20
+VER=1.24
 HOOK_SRC="$SRC/mei-vsc-hibernate-sleep.sh"
 
 if [[ $EUID -ne 0 ]]; then
@@ -16,7 +16,7 @@ echo "Building $NAME $VER against $(uname -r)..."
 make -C "$SRC" KERNEL_SRC=/lib/modules/$(uname -r)/build
 
 echo "Registering DKMS..."
-for old in 1.0 1.1 1.2 1.3 1.4 1.5 1.6 1.7 1.8 1.9 1.10 1.11 1.12 1.13 1.14 1.15 1.16 1.17 1.18 1.19 "$VER"; do
+for old in 1.0 1.1 1.2 1.3 1.4 1.5 1.6 1.7 1.8 1.9 1.10 1.11 1.12 1.13 1.14 1.15 1.16 1.17 1.18 1.19 1.20 1.21 1.22 1.23 "$VER"; do
   dkms remove "$NAME/$old" --all 2>/dev/null || true
 done
 rm -rf "/usr/src/${NAME}-${VER}"

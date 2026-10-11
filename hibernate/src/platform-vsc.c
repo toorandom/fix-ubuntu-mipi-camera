@@ -28,6 +28,19 @@
 #include "mei_dev.h"
 #include "vsc-tp.h"
 
+/*
+ * Interruptor de bisección (ver ipu-bridge). Con s4_fw_reload=0 el mei_vsc no
+ * programa la recarga de firmware del IVSC al volver de S4. En la práctica el
+ * log siempre dice "skip FW reload; mei-csi already bound", así que se espera
+ * poca diferencia — pero hay que medirlo, no suponerlo.
+ *     /sys/module/mei_vsc/parameters/s4_fw_reload
+ */
+static bool s4_fw_reload = true;
+module_param(s4_fw_reload, bool, 0644);
+MODULE_PARM_DESC(s4_fw_reload,
+		 "recargar el firmware del IVSC tras S4 (bisección)");
+
+
 #define MEI_VSC_DRV_NAME		"intel_vsc"
 
 #define MEI_VSC_MAX_MSG_SIZE		512
@@ -508,6 +521,11 @@ static void mei_vsc_schedule_fw_reload(struct mei_device *mei_dev,
 	if (vsc && mei_vsc_csi_already_bound(vsc)) {
 		pr_err("mei_vsc: %s: skip FW reload; mei-csi already bound\n",
 		       why);
+		return;
+	}
+
+	if (!s4_fw_reload) {
+		pr_err("mei_vsc: %s: s4_fw_reload=0, no se recarga\n", why);
 		return;
 	}
 

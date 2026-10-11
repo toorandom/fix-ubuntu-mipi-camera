@@ -79,6 +79,17 @@ struct vsc_tp {
 	wait_queue_head_t xfer_wait;
 	struct work_struct event_work;
 
+	/*
+	 * El SPI y los GPIO de este transporte los provee el puente USB LJCA,
+	 * que se suspende ANTES que nosotros: no hay device link que ordene
+	 * proveedor y consumidor. A partir de ahí toda operación de GPIO
+	 * devuelve -ENODEV y cada despertar agota 2 s de timeout, mientras el
+	 * MEI reintenta y resetea el bus con device_lock tomado y el core de
+	 * PM esperando. Esta bandera corta eso de raíz: transporte caído,
+	 * transferencia rechazada al instante.
+	 */
+	bool suspended;
+
 	vsc_tp_event_cb_t event_notify;
 	void *event_notify_context;
 	struct mutex event_notify_mutex;	/* protects event_notify + context */
@@ -295,6 +306,9 @@ int vsc_tp_xfer(struct vsc_tp *tp, u8 cmd, const void *obuf, size_t olen,
 
 	crc = ~crc32(~0, (u8 *)pkt, sizeof(pkt) + olen);
 	memcpy(pkt->buf + olen, &crc, sizeof(crc));
+
+	if (READ_ONCE(tp->suspended))
+		return -ENODEV;
 
 	ret = vsc_tp_wakeup_request(tp);
 	if (unlikely(ret))
@@ -560,13 +574,73 @@ static const struct acpi_device_id vsc_tp_acpi_ids[] = {
 };
 MODULE_DEVICE_TABLE(acpi, vsc_tp_acpi_ids);
 
+/*
+ * Upstream vsc-tp no implementa gestión de energía ninguna. Sin esto, los
+ * clientes del MEI siguen enviando comandos durante la congelación, cuando el
+ * puente LJCA que provee el bus ya no responde: 2 s de timeout por intento,
+ * reset del bus, reintento. Es lo que colgaba la entrada a S4.
+ *
+ * No hace falta apagar nada con cuidado: el parche de mei_vsc fuerza una
+ * recarga completa del firmware del VSC al volver, así que cualquier estado
+ * que dejáramos atrás se descarta igualmente.
+ */
+static int vsc_tp_pm_suspend(struct device *dev)
+{
+	struct vsc_tp *tp = spi_get_drvdata(to_spi_device(dev));
+
+	if (tp)
+		WRITE_ONCE(tp->suspended, true);
+
+	return 0;
+}
+
+static int vsc_tp_pm_resume(struct device *dev)
+{
+	struct vsc_tp *tp = spi_get_drvdata(to_spi_device(dev));
+
+	if (tp)
+		WRITE_ONCE(tp->suspended, false);
+
+	return 0;
+}
+
+static const struct dev_pm_ops vsc_tp_pm_ops = {
+	.suspend  = vsc_tp_pm_suspend,
+	.resume   = vsc_tp_pm_resume,
+	.freeze   = vsc_tp_pm_suspend,
+	.thaw     = vsc_tp_pm_resume,
+	.poweroff = vsc_tp_pm_suspend,
+	.restore  = vsc_tp_pm_resume,
+};
+
+/*
+ * Apagar cuelga la máquina de vez en cuando, desde mucho antes de este
+ * overlay. La causa es la misma que la del cuelgue al congelar:
+ * vsc_tp_remove() hace platform_device_unregister(tp->pdev), eso arrastra a
+ * mei-vsc -> mei_stop(), y mei_stop manda comandos MEI por un transporte
+ * cuyo puente USB LJCA puede haberse ido ya. Cerrar la puerta antes de
+ * desmontar convierte esas transferencias en -ENODEV inmediato.
+ *
+ * No se pierde nada: estamos apagando, no hay estado que preservar.
+ */
+static void vsc_tp_shutdown(struct spi_device *spi)
+{
+	struct vsc_tp *tp = spi_get_drvdata(spi);
+
+	if (tp)
+		WRITE_ONCE(tp->suspended, true);
+
+	vsc_tp_remove(spi);
+}
+
 static struct spi_driver vsc_tp_driver = {
 	.probe = vsc_tp_probe,
 	.remove = vsc_tp_remove,
-	.shutdown = vsc_tp_remove,
+	.shutdown = vsc_tp_shutdown,
 	.driver = {
 		.name = "vsc-tp",
 		.acpi_match_table = vsc_tp_acpi_ids,
+		.pm = &vsc_tp_pm_ops,
 	},
 };
 module_spi_driver(vsc_tp_driver);

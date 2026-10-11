@@ -1,32 +1,4 @@
-# mei-vsc-hibernate — IPU6 / IVSC camera across hibernation
-
-**Licence: GPL-2.0** (not the MIT of the rest of this repository — see `LICENSE` here).
-
-## Credit and provenance
-
-This is an adaptation of the GPL-2.0 DKMS overlay **`mei-vsc-hibernate` 1.18**, written
-by a third party for a **Dell Precision 5690** with an **ov02e10** sensor on Ubuntu 24.04
-/ kernel 7.0.0-31-generic. That work did the hard part — the non-ACPI swnode i2c client,
-the freeze-time teardown, and the long list of approaches that Oops (documented in its
-"Do not" section, all of it still worth reading). We have not been able to identify the
-original author or a canonical URL; **if that is you, please open an issue and we will
-credit you properly.**
-
-What this fork changes:
-
-- **Retargeted to `ov02c10`** on a **Dell XPS 13 9340** (`OVTI02E1` → `OVTI02C1`,
-  `ov02e10` → `ov02c10`), including the sensor's `i2c_device_id` patch.
-- **Fixes the unbalanced reference count on the IVSC software node** (v1.19), which is
-  what crashed the resume. See below and `patches/0001-*.patch` — that one is an upstream
-  bug, not specific to this overlay.
-- **Ships `ov02c10` inside the DKMS package** (v1.20) so a kernel upgrade rebuilds it.
-  Installed by hand it silently disappears on the next kernel, and the camera stops
-  coming back from hibernation with no obvious cause.
-- Makes this overlay's own sleep hook actually run on the lid path (it guarded on
-  `hibernate`, but systemd passes `suspend-then-hibernate`).
-
-Upstream's warning applies unchanged: **this is a workaround, not an upstream patch
-series. Use at your own risk.** Secure Boot needs these modules signed with your MOK.
+# mei-vsc-hibernate 1.18 (IPU6 / IVSC after S4)
 
 GPL-2.0 overlay for in-tree `mei-vsc` + `ipu-bridge`. Tested on Dell Precision 5690, Ubuntu 24.04, kernel **7.0.0-31-generic**. **Two hibernates in one boot** (2026-09-07): sensor rebound as a non-ACPI i2c client (`18-0010`, `companion=none`), no Oops, no `refcount_t underflow`.
 
@@ -179,3 +151,66 @@ so `71-ipu6-sensor-orientation.rules` triggers `ipu6-sensor-orientation@.service
 subdev's udev `add`. It must set *and verify* in a loop: `ipu_bridge` does a deferred
 re-probe right after the udev event (`ov02c10 bound after delay`) and that bind resets the
 sensor registers, wiping a single-shot write.
+
+
+## v1.24 — the third hang, bisected but not solved
+
+With the first two fixed, a third failure appeared that had always been hidden behind
+them: the **third hibernation of any boot** hangs, and i915 reports
+
+```
+GT1: GSC proxy component didn't bind within the expected timeout
+GT1: GSC proxy handler failed to init
+```
+
+`GSC_PROXY_INIT_TIMEOUT_MS` is **20000** in
+`drivers/gpu/drm/i915/gt/uc/intel_gsc_proxy.c`. The screen dies there; the journal is no
+help because journald is frozen from `Filesystems sync` onward. Every observation below
+came from photographing the console, which only works because `console_suspend=N`.
+
+It is **not** kernel-specific: identical on `7.0.0-1015-oem` and `7.0.0-38-generic`.
+
+### Bisection
+
+Runtime module switches (`ipu_bridge.s4_teardown`, `ipu_bridge.s4_reattach`,
+`mei_vsc.s4_fw_reload`) made this cheap — no rebuild between rounds.
+
+| round | teardown | reattach | fw_reload | sleep hook | result |
+|---|---|---|---|---|---|
+| control (no overlay) | – | – | – | no | 4 clean |
+| 1 | off | **on** | on | yes | hung on the 3rd |
+| 2 | on | **on** | on | **no** | hung on the 3rd |
+| 3 | off | **off** | off | no | 3 clean |
+| 4 | off | **on** | off | no | hung on the 3rd |
+
+**The deferred reattach is the cause.** Exonerated: the freeze-time i2c teardown, the
+sleep hook, and the IVSC firmware reload.
+
+A methodological trap worth repeating: the failure is the third hibernation *of a boot*,
+not of a round. Chaining rounds without rebooting silently tests cycle 4+ and passes.
+
+### Two hypotheses tested and disproven
+
+- **"We are stealing i915's turn."** Delaying the reattach from 50 ms to 25 s — past the
+  whole 20 s window — changed nothing. It hangs either way, so it is not about timing.
+  (`s4_reattach_delay_ms` is still there if you want to experiment.)
+- **"We are clogging the deferred probe list."** `/sys/kernel/debug/devices_deferred` is
+  empty and no `-EPROBE_DEFER` appears in the failing boots.
+
+So it is something the reattach *does* — `device_attach()` on mei-csi, or the
+unregister/recreate dance on the sensor's i2c client — that leaves state behind. The next
+step would be splitting those into separate switches.
+
+### Where that leaves you
+
+`s4_reattach` is a runtime switch, so the trade-off is yours to make and to change:
+
+```bash
+# camera survives hibernation, but ~every 3rd hibernation hangs the machine
+echo 1 | sudo tee /sys/module/ipu_bridge/parameters/s4_reattach
+
+# hibernation is rock solid, camera needs a reboot after hibernating
+echo 0 | sudo tee /sys/module/ipu_bridge/parameters/s4_reattach
+```
+
+`/etc/modprobe.d/zz-ipu6-camera.conf` sets the boot default, and ships as `0`.
