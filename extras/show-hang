@@ -1,0 +1,28 @@
+#!/bin/bash
+# Show whatever was recorded about the last hang on the way into hibernation.
+#
+# The journal never gets to tell you: journald is frozen at "Freezing user
+# space processes", so the log always ends on that line whether or not that is
+# where the kernel actually stopped. The trace is in pstore instead (NVRAM,
+# survives the reboot), put there by hung_task_panic.
+#
+# Needs 90-ipu6-hang-debug.conf and ipu6-hang-debug.service installed.
+echo "== pstore (panic recorded in NVRAM) =="
+if sudo ls /sys/fs/pstore/* >/dev/null 2>&1; then
+    for f in /sys/fs/pstore/*; do
+        echo "--- $f ---"
+        sudo cat "$f"
+    done
+    echo
+    echo "Once you have copied it, clear it to leave room for the next one:"
+    echo "   sudo rm /sys/fs/pstore/*"
+else
+    echo "   empty -- no panic was recorded"
+    echo "   (either it hung harder than the hung-task detector can catch --"
+    echo "    a deadlock with interrupts off, or firmware -- or no task was"
+    echo "    stuck in D state)"
+fi
+
+echo
+echo "== last kernel messages of the previous boot =="
+journalctl -b -1 -k --no-pager -o short-precise 2>/dev/null | tail -25

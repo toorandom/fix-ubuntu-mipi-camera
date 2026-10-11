@@ -54,3 +54,27 @@ post-S4 re-probe. No sudo needed if you are in the `video` group. An app that al
 the camera open keeps the old framing until it reopens the device.
 
 Installed by `ipu6-hibernate-fix.sh`.
+
+## `show-hang`, `90-ipu6-hang-debug.conf`, `ipu6-hang-debug.service` — see an invisible hang
+
+A hang entering S4 records nothing. The journal ends at `Freezing user space processes`
+every time, because journald is one of the processes frozen at that step — so that line
+tells you where logging stopped, not where the kernel did.
+
+```bash
+sudo cp 90-ipu6-hang-debug.conf /etc/sysctl.d/ && sudo sysctl --system
+sudo cp ipu6-hang-debug.service /etc/systemd/system/
+sudo systemctl enable --now ipu6-hang-debug.service
+sudo install -m 0755 show-hang /usr/local/sbin/
+```
+
+`hung_task_panic=1` turns a task stuck 60s in D state into a panic, `efi_pstore` writes
+the backtrace to NVRAM where it survives the reboot, and `panic=20` reboots the machine
+instead of leaving you holding the power button. Afterwards:
+
+```bash
+sudo show-hang
+```
+
+**Remove it once you are done.** `hung_task_panic` also fires on unrelated slow I/O, so an
+unexpected reboot with no hibernation involved is this, not a new bug.

@@ -1,0 +1,15 @@
+[Unit]
+Description=Mantener visible la depuración del cuelgue al hibernar
+DefaultDependencies=no
+After=sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# La consola no debe suspenderse: si se suspende, los mensajes del cuelgue no
+# salen por ningún sitio (journald también está congelado en ese momento).
+ExecStart=/bin/sh -c 'echo N > /sys/module/printk/parameters/console_suspend'
+ExecStart=/bin/sh -c 'echo 1 > /sys/power/pm_debug_messages'
+
+[Install]
+WantedBy=multi-user.target

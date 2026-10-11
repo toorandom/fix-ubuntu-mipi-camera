@@ -145,6 +145,40 @@ Do **not** "fix" the reference leaks on the sensor side
 `ipu_bridge_destroy_sensor_i2c_clients()`): those are leaks rather than underflows, and
 they are what keeps the sensor's own node alive against the same core bug.
 
+## When it hangs and the log tells you nothing
+
+A hang on the way into S4 leaves no trace: the journal always ends at
+`Freezing user space processes`, because journald is frozen at that same step. Guessing
+from that line is how you waste an afternoon. Make the next hang recordable instead:
+
+```bash
+sudo cp extras/90-ipu6-hang-debug.conf /etc/sysctl.d/ && sudo sysctl --system
+sudo cp extras/ipu6-hang-debug.service /etc/systemd/system/
+sudo systemctl enable --now ipu6-hang-debug.service
+sudo install -m 0755 extras/show-hang /usr/local/sbin/
+```
+
+That sets `hung_task_panic=1` with a 60s timeout, so a task stuck in D state panics
+instead of hanging silently; `panic=20`, so the machine reboots itself rather than
+needing the power button; and `efi_pstore` records the backtrace in NVRAM, where it
+survives the reboot. It also keeps the console alive through suspend
+(`console_suspend=N`) and turns on `pm_debug_messages`.
+
+After the next hang:
+
+```bash
+sudo show-hang
+```
+
+- **A backtrace** names the driver and function. Ordinary work from there.
+- **Empty pstore** means it hung harder than the hung-task detector catches — a deadlock
+  with interrupts off, or firmware. Then isolate by variable instead: a long s2idle leg
+  lets the platform go deeper (LJCA autosuspend, VSC fully off) than a short one, so try
+  `HibernateDelaySec=1min` for a few cycles and compare.
+
+Clear it with `sudo rm /sys/fs/pstore/*` once you have copied it, and **remove the whole
+setup when you are done**: `hung_task_panic` will also fire on unrelated slow I/O.
+
 ## Rolling back
 
 ```bash
