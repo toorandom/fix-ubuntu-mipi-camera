@@ -153,7 +153,7 @@ re-probe right after the udev event (`ov02c10 bound after delay`) and that bind 
 sensor registers, wiping a single-shot write.
 
 
-## v1.26 — five hypotheses, all disproven
+## v1.26 — six hypotheses, all disproven, across three kernels
 
 The third-hibernation hang survived everything. For the record, so nobody repeats it:
 
@@ -164,6 +164,7 @@ The third-hibernation hang survived everything. For the record, so nobody repeat
 | stale `mei-csi` devices accumulate | counted `/sys/bus/mei/devices/` per cycle | identical every cycle |
 | i915 module refcount leaks | `/proc/modules` per cycle | +1 once, then flat |
 | `mei_vsc_freeze()` aborting hibernation | stopped propagating `-EAGAIN` | still hangs |
+| an unreleased GSC proxy session on the ME | forced `unbind`+`bind` of `mei_gsc_proxy` after every resume | still hangs |
 
 The fourth and fifth came from capturing *everything* each cycle and diffing: all module
 refcounts, every bus's device list, all driver bindings, device nodes, deferred probes,
@@ -175,6 +176,18 @@ error from a `.freeze` callback aborts the whole hibernation, so it allocates th
 and exits without writing an image or powering off, and `suspend-then-hibernate` falls
 back to s2idle. It looks exactly like a successful hibernation from outside. Fixed, but it
 was not the hang.
+
+### Not a kernel regression
+
+Reproduced identically on **three kernels**: `7.0.0-1015-oem`, `7.0.0-38-generic` and
+**7.2.6 mainline** from the Ubuntu mainline PPA. Eight months of upstream fixes to i915,
+MEI and PM change nothing, so waiting for a newer kernel will not help. Worth stating in
+any bug report.
+
+(On 7.2.6 all four overlay modules still build cleanly, but Ubuntu's out-of-tree
+`intel-ipu6-psys` is shipped prebuilt rather than as DKMS source, so there is no
+`/dev/ipu-psys0` and therefore no HAL path there. The sensor still binds, which is all the
+hibernation test needs.)
 
 ### What is left
 
