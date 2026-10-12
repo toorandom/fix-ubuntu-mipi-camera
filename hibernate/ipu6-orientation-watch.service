@@ -1,0 +1,13 @@
+[Unit]
+Description=Mantener derecha la imagen del sensor ov02c10 (montado a 180°)
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/ipu6-orientation-watch
+Restart=always
+RestartSec=5
+Nice=10
+# sobrevive a suspensión e hibernación sin hacer nada especial
+[Install]
+WantedBy=multi-user.target

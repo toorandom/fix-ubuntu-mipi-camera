@@ -316,6 +316,13 @@ voltear-camara --status   # just report
 It finds the sensor subdev by name — the number changes on every boot and every post-S4
 re-probe — and needs no sudo if you are in the `video` group.
 
+You should rarely need it: `ipu6-orientation-watch` keeps the flips set continuously. A
+one-shot fix does not hold, because anything can clear them later — a deferred re-probe,
+the Intel HAL configuring the sensor, a resume. The earlier udev-triggered service set
+them, verified for eight seconds, exited, and the picture still came up upside down
+afterwards. The watcher re-checks every five seconds instead, which costs nothing and
+cannot lose a race.
+
 ---
 
 ## When the image freezes

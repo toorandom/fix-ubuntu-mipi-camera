@@ -1,0 +1,44 @@
+#!/bin/bash
+# Mantiene la imagen del ov02c10 derecha, siempre.
+#
+# El sensor va montado a 180° en este portátil. Un servicio de una sola pasada
+# no basta: cualquier cosa puede borrar los flips después de que termine
+# (re-probe del sensor, el HAL al configurar el pipeline, un resume...).
+# Visto el 2026-10-12: el servicio verificó 8 s, salió, y la imagen apareció
+# volteada más tarde. Por eso esto vigila de forma continua.
+#
+# Coste: una lectura de sysfs cada 5 s. Despreciable.
+set -u
+INTERVALO=5
+
+subdev_del_sensor() {
+    local d
+    for d in /sys/class/video4linux/v4l-subdev*; do
+        [ -r "$d/name" ] || continue
+        if grep -q '^ov02c10' "$d/name" 2>/dev/null; then
+            echo "/dev/$(basename "$d")"; return 0
+        fi
+    done
+    return 1
+}
+
+anterior=""
+while :; do
+    if dev=$(subdev_del_sensor); then
+        out=$(v4l2-ctl -d "$dev" --list-ctrls 2>/dev/null)
+        if [ -n "$out" ]; then
+            if ! grep -q 'horizontal_flip.*value=1' <<<"$out" ||
+               ! grep -q 'vertical_flip.*value=1'   <<<"$out"; then
+                timeout 5 v4l2-ctl -d "$dev" \
+                    --set-ctrl=horizontal_flip=1,vertical_flip=1 2>/dev/null
+                # un aviso por episodio, no uno cada 5 s
+                [ "$anterior" = "$dev-mal" ] || \
+                    logger -t ipu6-orientation "flips restaurados en $dev"
+                anterior="$dev-mal"
+            else
+                anterior="$dev-ok"
+            fi
+        fi
+    fi
+    sleep "$INTERVALO"
+done
