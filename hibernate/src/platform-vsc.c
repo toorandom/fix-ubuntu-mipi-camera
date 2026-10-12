@@ -542,7 +542,26 @@ static int mei_vsc_freeze(struct device *dev)
 	/* Arm even if -EAGAIN; flag must land in the hibernation image. */
 	mei_vsc_need_fw_reload = true;
 	pr_err("mei_vsc: freeze: arm deferred IVSC FW reload\n");
-	return ret;
+
+	/*
+	 * NO propagar el error. mei_vsc_suspend() devuelve -EAGAIN cuando la
+	 * cola de escritura del MEI no está ociosa, y devolver eso desde un
+	 * callback de .freeze ABORTA la hibernación entera: el kernel reserva
+	 * la memoria del snapshot y sale sin "Creating image", sin escribir
+	 * nada y sin apagarse, y suspend-then-hibernate recae en s2idle.
+	 * Visto el 2026-10-12 como
+	 *   intel_vsc: PM: dpm_run_callback(): platform_pm_freeze returns -11
+	 * y arruinó una mañana entera de pruebas, porque por fuera parece que
+	 * hibernó.
+	 *
+	 * Rechazar la hibernación por esto no tiene sentido: al volver
+	 * forzamos una recarga completa del firmware del IVSC, así que
+	 * cualquier escritura pendiente se descarta igualmente.
+	 */
+	if (ret)
+		pr_err("mei_vsc: freeze: %d ignorado, se hiberna igual\n", ret);
+
+	return 0;
 }
 
 static int mei_vsc_thaw(struct device *dev)

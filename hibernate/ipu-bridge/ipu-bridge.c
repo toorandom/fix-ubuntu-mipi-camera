@@ -57,6 +57,23 @@ MODULE_PARM_DESC(s4_reattach,
  * Se paga con que la cámara tarde eso en volver tras hibernar. Es ajustable
  * en caliente para poder buscar el mínimo que funcione.
  */
+/*
+ * Con s4_force_attach=0 NO llamamos a device_attach() sobre mei-csi: nos
+ * limitamos a poner el fwnode y esperar a que el bus MEI lo enlace por su
+ * cuenta.
+ *
+ * Razón: la bisección señaló el reenganche como causa del cuelgue de la 3ª
+ * hibernación (i915 esperando al componente del GSC proxy), y de las tres
+ * cosas que hace el reenganche, device_attach() es la única que mete mano en
+ * el modelo de dispositivos desde fuera, sobre un dispositivo del bus 'mei'
+ * -- el mismo bus donde vive mei_gsc_proxy, que es justo lo que i915 espera.
+ * Las otras dos acciones son locales a la cámara.
+ */
+static bool s4_force_attach = true;
+module_param(s4_force_attach, bool, 0644);
+MODULE_PARM_DESC(s4_force_attach,
+		 "forzar device_attach() sobre mei-csi tras S4 (0 = esperar al bus)");
+
 static unsigned int s4_reattach_delay_ms = 25000;
 module_param(s4_reattach_delay_ms, uint, 0644);
 MODULE_PARM_DESC(s4_reattach_delay_ms,
@@ -1275,6 +1292,12 @@ static void ipu_bridge_deferred_reattach(struct work_struct *work)
 		return;
 	}
 
+	if (!s4_force_attach) {
+		pr_err("ipu_bridge: deferred: s4_force_attach=0, espero al bus\n");
+		put_device(csi_dev);
+		goto again;
+	}
+
 	pr_err("ipu_bridge: deferred: device_attach %s\n",
 	       dev_name(csi_dev));
 	ret = device_attach(csi_dev);
@@ -1288,7 +1311,7 @@ static void ipu_bridge_deferred_reattach(struct work_struct *work)
 	}
 
 again:
-	if (pass++ < 1) {
+	if (pass++ < (s4_force_attach ? 1 : 20)) {
 		schedule_delayed_work(&ipu_bridge_reattach_dwork,
 				      msecs_to_jiffies(450));
 	} else {

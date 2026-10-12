@@ -1,0 +1,24 @@
+#!/bin/bash
+# ¿Las hibernaciones de este arranque fueron REALES o abortaron?
+#
+# OJO: "Creating image" es pr_debug y SOLO aparece con pm_debug_messages=1.
+# Usarlo como marcador sin comprobar eso da falsos negativos (me pasó).
+# El marcador fiable es el patrón de aborto: 'hibernation exit' seguido
+# inmediatamente de 'suspend entry', sin apagarse en medio.
+b="${1:-0}"
+dbg=$(cat /sys/power/pm_debug_messages 2>/dev/null)
+int=$(journalctl -b "$b" -k --no-pager 2>/dev/null | grep -c 'Allocated .* kbytes')
+echo "arranque $b:  intentos de hibernación = $int   (pm_debug_messages=$dbg)"
+[ "$int" = 0 ] && exit 0
+
+journalctl -b "$b" -k --no-pager -o short-unix 2>/dev/null \
+  | grep -E 'hibernation: hibernation exit|PM: suspend entry' \
+  | awk '
+    /hibernation exit/ { t=int($1); pend=1; next }
+    /suspend entry/ { if (pend && int($1)-t < 15) { ab++ }; pend=0 }
+    END { if (ab) printf "  !! %d aborto(s): salió de hibernar y recayó en s2idle sin apagarse\n", ab;
+          else print "  sin patrón de aborto" }'
+
+journalctl -b "$b" -k --no-pager 2>/dev/null \
+  | grep -iE 'dpm_run_callback|failed to suspend|Some devices failed' \
+  | tail -2 | sed 's/.*kernel: /  dispositivo problemático: /'

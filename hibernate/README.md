@@ -153,64 +153,45 @@ re-probe right after the udev event (`ov02c10 bound after delay`) and that bind 
 sensor registers, wiping a single-shot write.
 
 
-## v1.24 — the third hang, bisected but not solved
+## v1.26 — five hypotheses, all disproven
 
-With the first two fixed, a third failure appeared that had always been hidden behind
-them: the **third hibernation of any boot** hangs, and i915 reports
+The third-hibernation hang survived everything. For the record, so nobody repeats it:
 
-```
-GT1: GSC proxy component didn't bind within the expected timeout
-GT1: GSC proxy handler failed to init
-```
+| hypothesis | how it was tested | result |
+|---|---|---|
+| we delay i915 past its window | moved the reattach from 50 ms to 25 s, past the whole 20 s timeout | no change |
+| we clog the deferred probe list | `/sys/kernel/debug/devices_deferred` | empty, no `-EPROBE_DEFER` |
+| stale `mei-csi` devices accumulate | counted `/sys/bus/mei/devices/` per cycle | identical every cycle |
+| i915 module refcount leaks | `/proc/modules` per cycle | +1 once, then flat |
+| `mei_vsc_freeze()` aborting hibernation | stopped propagating `-EAGAIN` | still hangs |
 
-`GSC_PROXY_INIT_TIMEOUT_MS` is **20000** in
-`drivers/gpu/drm/i915/gt/uc/intel_gsc_proxy.c`. The screen dies there; the journal is no
-help because journald is frozen from `Filesystems sync` onward. Every observation below
-came from photographing the console, which only works because `console_suspend=N`.
+The fourth and fifth came from capturing *everything* each cycle and diffing: all module
+refcounts, every bus's device list, all driver bindings, device nodes, deferred probes,
+D-state tasks and the component masters. **After two hibernations the settled state is
+byte-identical to after one.** Nothing accumulates anywhere the kernel exposes it.
 
-It is **not** kernel-specific: identical on `7.0.0-1015-oem` and `7.0.0-38-generic`.
+`mei_vsc_freeze()` propagating `-EAGAIN` was a real bug found along the way: returning an
+error from a `.freeze` callback aborts the whole hibernation, so it allocates the snapshot
+and exits without writing an image or powering off, and `suspend-then-hibernate` falls
+back to s2idle. It looks exactly like a successful hibernation from outside. Fixed, but it
+was not the hang.
 
-### Bisection
+### What is left
 
-Runtime module switches (`ipu_bridge.s4_teardown`, `ipu_bridge.s4_reattach`,
-`mei_vsc.s4_fw_reload`) made this cheap — no rebuild between rounds.
+The failure is deterministic at the third hibernation of a boot, invisible in every
+kernel-exposed structure, and reported as i915 never seeing the GSC proxy component bind
+within 20 s. The GSC proxy is a proxy *to the CSME firmware*, so the remaining hypothesis
+is firmware-side session state on the ME that is not released across S4 — which Linux
+cannot show us. Untested: forcing a `mei_gsc_proxy` unbind/rebind after each resume to see
+whether that resets it.
 
-| round | teardown | reattach | fw_reload | sleep hook | result |
-|---|---|---|---|---|---|
-| control (no overlay) | – | – | – | no | 4 clean |
-| 1 | off | **on** | on | yes | hung on the 3rd |
-| 2 | on | **on** | on | **no** | hung on the 3rd |
-| 3 | off | **off** | off | no | 3 clean |
-| 4 | off | **on** | off | no | hung on the 3rd |
+### Two traps that cost hours
 
-**The deferred reattach is the cause.** Exonerated: the freeze-time i2c teardown, the
-sleep hook, and the IVSC firmware reload.
-
-A methodological trap worth repeating: the failure is the third hibernation *of a boot*,
-not of a round. Chaining rounds without rebooting silently tests cycle 4+ and passes.
-
-### Two hypotheses tested and disproven
-
-- **"We are stealing i915's turn."** Delaying the reattach from 50 ms to 25 s — past the
-  whole 20 s window — changed nothing. It hangs either way, so it is not about timing.
-  (`s4_reattach_delay_ms` is still there if you want to experiment.)
-- **"We are clogging the deferred probe list."** `/sys/kernel/debug/devices_deferred` is
-  empty and no `-EPROBE_DEFER` appears in the failing boots.
-
-So it is something the reattach *does* — `device_attach()` on mei-csi, or the
-unregister/recreate dance on the sensor's i2c client — that leaves state behind. The next
-step would be splitting those into separate switches.
-
-### Where that leaves you
-
-`s4_reattach` is a runtime switch, so the trade-off is yours to make and to change:
-
-```bash
-# camera survives hibernation, but ~every 3rd hibernation hangs the machine
-echo 1 | sudo tee /sys/module/ipu_bridge/parameters/s4_reattach
-
-# hibernation is rock solid, camera needs a reboot after hibernating
-echo 0 | sudo tee /sys/module/ipu_bridge/parameters/s4_reattach
-```
-
-`/etc/modprobe.d/zz-ipu6-camera.conf` sets the boot default, and ships as `0`.
+- **`Creating image` and `Need to copy N pages` are `pr_debug`.** They only appear with
+  `pm_debug_messages=1`. Using them to tell a real hibernation from an aborted one gives
+  false negatives when that is off — it invalidated a whole morning of measurements here.
+  `extras/hiber-check` detects the abort pattern instead.
+- **The journal always ends at `Filesystems sync` / `Freezing user space processes`**,
+  because journald is frozen from there on. That line says nothing about where the kernel
+  stopped. Twice this looked like "it hung entering S4" when it had hibernated fine and
+  died on resume.
